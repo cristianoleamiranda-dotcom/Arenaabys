@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arenaabys · Motion Graphics Reel</title>
+<style>
+  :root{
+    --ink:#0b0b0c;
+    --paper:#f2efe6;
+    --lime:#c7f94a;
+    --blue:#7ba7ff;
+    --alert:#ff5c39;
+    --muted:#8b8b84;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--ink);color:var(--paper);
+    font-family:"Inter","Helvetica Neue",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  body{display:flex;flex-direction:column;overflow:hidden}
+
+  header{
+    display:flex;align-items:center;gap:14px;padding:10px 18px;
+    border-bottom:1px solid #1e1e20;font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--muted);flex:0 0 auto;
+  }
+  header .dot{width:7px;height:7px;border-radius:50%;background:var(--lime);box-shadow:0 0 12px var(--lime)}
+  header b{color:var(--paper);font-weight:600;letter-spacing:.1em}
+  header .spacer{flex:1}
+
+  main{flex:1 1 auto;display:grid;place-items:center;padding:18px;min-height:0}
+  .stage-wrap{position:relative;width:100%;height:100%;display:grid;place-items:center}
+  canvas{
+    display:block;
+    border-radius:10px;background:#000;
+    box-shadow:0 30px 80px rgba(0,0,0,.65), 0 0 0 1px #1c1c1f;
+  }
+
+  .hud{
+    position:absolute;top:12px;right:16px;display:flex;gap:10px;font-variant-numeric:tabular-nums;
+    font-size:11px;letter-spacing:.1em;color:#9a9a92;pointer-events:none;
+  }
+  .hud span{padding:4px 8px;border:1px solid #26262a;border-radius:999px;background:rgba(11,11,12,.55)}
+
+  footer{
+    flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:12px 18px 16px;
+    border-top:1px solid #1e1e20;
+  }
+  button{
+    appearance:none;border:1px solid #2c2c30;background:#141416;color:var(--paper);
+    padding:9px 14px;border-radius:999px;font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+    cursor:pointer;transition:.18s ease;font-family:inherit;font-weight:600;
+  }
+  button:hover{border-color:#4a4a52;background:#1c1c20}
+  button.primary{background:var(--lime);color:#0b0b0c;border-color:var(--lime)}
+  button.primary:hover{filter:brightness(1.06)}
+  button[aria-pressed="true"]{border-color:var(--lime);color:var(--lime)}
+
+  .timeline{position:relative;flex:1 1 auto;height:34px;display:flex;align-items:center;cursor:pointer}
+  .track{position:relative;width:100%;height:4px;background:#232327;border-radius:2px;overflow:visible}
+  .fill{position:absolute;inset:0 auto 0 0;width:0;background:var(--lime);border-radius:2px}
+  .mark{position:absolute;top:-3px;width:1px;height:10px;background:#3a3a40}
+  .head{position:absolute;top:-4px;width:9px;height:12px;margin-left:-4px;background:var(--paper);border-radius:2px;box-shadow:0 0 10px rgba(242,239,230,.5)}
+
+  .keys{font-size:11px;color:#6c6c66;letter-spacing:.08em;white-space:nowrap}
+  .keys b{color:#9a9a92;font-weight:600}
+  @media (max-width:760px){ .keys{display:none} header{font-size:10px} }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot"></span>
+  <b>Arenaabys</b>
+  <span>· motion graphics reel · 120 bpm · 28 s</span>
+  <span class="spacer"></span>
+  <span id="status">listo</span>
+</header>
+
+<main>
+  <div class="stage-wrap">
+    <canvas id="stage" width="1280" height="720"></canvas>
+    <div class="hud">
+      <span id="tc">00:00:00</span>
+      <span id="beat">beat 0</span>
+      <span id="fps">-- fps</span>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <button id="play" class="primary">▶ Reproducir</button>
+  <button id="mute" aria-pressed="false">♪ Audio on</button>
+  <button id="grid" aria-pressed="false">Guías</button>
+  <button id="loop" aria-pressed="true">Loop</button>
+  <div class="timeline" id="timeline" title="Click para buscar">
+    <div class="track" id="track"><div class="fill" id="fill"></div><div class="head" id="head"></div></div>
+  </div>
+  <div class="keys"><b>espacio</b> play · <b>←/→</b> ±1s · <b>m</b> mute · <b>g</b> guías</div>
+</footer>
+
+<script type="module" src="./reel.js"></script>
+</body>
+</html>

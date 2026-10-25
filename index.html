@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arenaabys · Motion Skills Hub</title>
+<style>
+  :root{--ink:#0b0b0c;--paper:#f2efe6;--lime:#c7f94a;--blue:#7ba7ff;--muted:#8b8b84;--line:#232327}
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--ink);color:var(--paper);font-family:"Inter","Helvetica Neue",Helvetica,Arial,sans-serif}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1440px;margin:0 auto;padding:28px clamp(18px,3vw,44px) 56px}
+  header{display:flex;align-items:center;gap:12px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  header .dot{width:7px;height:7px;border-radius:50%;background:var(--lime);box-shadow:0 0 14px var(--lime)}
+  header b{color:var(--paper);letter-spacing:.12em}
+  header .spacer{flex:1}
+  header a{border-bottom:1px solid transparent;padding-bottom:2px}
+  header a:hover{border-color:var(--lime);color:var(--paper)}
+
+  .grid{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:clamp(20px,3vw,44px);align-items:start;margin-top:clamp(24px,4vw,54px)}
+  @media (max-width:960px){.grid{grid-template-columns:1fr}}
+
+  h1{font-size:clamp(38px,5vw,64px);line-height:.94;letter-spacing:-.035em;margin:0 0 18px;font-weight:800}
+  h1 em{font-style:normal;color:var(--lime)}
+  .lede{font-size:16px;line-height:1.55;color:#c9c9c0;margin:0 0 26px;max-width:52ch}
+  .lede b{color:var(--paper);font-weight:600}
+
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:26px 0}
+  .stat{border:1px solid var(--line);border-radius:12px;padding:14px 12px;background:#101012}
+  .stat strong{display:block;font-size:26px;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+  .stat span{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+
+  .nav{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+  .nav a{display:flex;align-items:baseline;gap:12px;padding:11px 2px;border-top:1px solid var(--line);font-size:14px;transition:.16s}
+  .nav a:last-child{border-bottom:1px solid var(--line)}
+  .nav a:hover{padding-left:8px;color:var(--lime)}
+  .nav a i{font-style:normal;font-size:10px;color:#5f5f59;letter-spacing:.14em;min-width:22px}
+  .nav a small{margin-left:auto;color:#6f6f68;font-size:11px;letter-spacing:.08em}
+
+  .stage{border:1px solid var(--line);border-radius:16px;overflow:hidden;background:#000;box-shadow:0 40px 100px rgba(0,0,0,.6)}
+  .stage iframe{display:block;width:100%;aspect-ratio:16/9;border:0;background:#000}
+  .stage .bar{display:flex;gap:14px;align-items:center;padding:10px 14px;border-top:1px solid var(--line);font-size:11px;letter-spacing:.1em;color:#6f6f68;text-transform:uppercase;background:#0e0e10}
+  .stage .bar .live{display:flex;align-items:center;gap:7px;color:var(--lime)}
+  .stage .bar .live i{width:6px;height:6px;border-radius:50%;background:var(--lime);animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.25}}
+  .stage .bar .spacer{flex:1}
+
+  .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-top:44px}
+  .card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#0f0f11}
+  .card h3{margin:0 0 8px;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--lime)}
+  .card p{margin:0;font-size:13px;line-height:1.55;color:#a9a9a1}
+  footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--line);font-size:11px;color:#5f5f59;letter-spacing:.08em;display:flex;flex-wrap:wrap;gap:14px}
+  footer .spacer{flex:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot"></span>
+    <b>Arenaabys</b>
+    <span>· motion skills hub</span>
+    <span class="spacer"></span>
+    <a href="https://github.com/cristianoleamiranda-dotcom/Arenaabys" target="_blank" rel="noopener">github ↗</a>
+  </header>
+
+  <div class="grid">
+    <section>
+      <h1>Motion graphics,<br /><em>activado</em>.</h1>
+      <p class="lede">
+        Hub de producción audiovisual: <b>39 skills</b> listas para un agente de IA, cuatro
+        documentos de oficio (teoría, ritmo, tutorial y recursos de GitHub) y una
+        <b>memoria de largo plazo</b> que viaja con el repositorio. Todo en español.
+      </p>
+
+      <div class="stats">
+        <div class="stat"><strong id="n-skills">39</strong><span>skills activas</span></div>
+        <div class="stat"><strong>04</strong><span>documentos</span></div>
+        <div class="stat"><strong>120</strong><span>bpm del reel</span></div>
+      </div>
+
+      <nav class="nav">
+        <a href="docs/01-que-es-motion-graphics.md"><i>01</i>Qué es el motion graphics<small>teoría</small></a>
+        <a href="docs/02-guia-edicion-audiovisual.md"><i>02</i>Edición audiovisual + audio<small>ritmo · LUFS</small></a>
+        <a href="docs/03-tutorial-practico.md"><i>03</i>Tutorial y 3 ejercicios<small>paso a paso</small></a>
+        <a href="docs/04-recursos-github.md"><i>04</i>Recursos de GitHub<small>catálogo</small></a>
+        <a href="skills/motion-graphics-es/SKILL.md"><i>★</i>Skill: motion-graphics-es<small>propia</small></a>
+        <a href="skills/audio-post-motion/SKILL.md"><i>♪</i>Skill: audio-post-motion<small>propia</small></a>
+        <a href="memory/README.md"><i>◎</i>Memoria del proyecto<small>recuerdos</small></a>
+        <a href="AGENTS.md"><i>⌘</i>Protocolo del agente<small>AGENTS.md</small></a>
+      </nav>
+    </section>
+
+    <section>
+      <div class="stage">
+        <iframe src="demo/index.html" title="Reel de motion graphics" allow="autoplay; fullscreen"></iframe>
+        <div class="bar">
+          <span class="live"><i></i>live preview</span>
+          <span>canvas 2d + webaudio</span>
+          <span class="spacer"></span>
+          <span>28 s · 120 bpm · 16:9</span>
+          <a href="demo/index.html" target="_blank" rel="noopener" style="color:var(--lime)">abrir ↗</a>
+        </div>
+      </div>
+      <p class="lede" style="margin-top:18px;font-size:13px;color:#8b8b84">
+        El reel está dibujado frame a frame en canvas y su banda sonora se sintetiza en WebAudio:
+        imagen y audio comparten el mismo reloj, así que cada corte cae exactamente en el pulso.
+        Pulsa <b style="color:var(--lime)">Reproducir</b> para escuchar el score, o <b>G</b> dentro del
+        player para ver la retícula y las safe areas.
+      </p>
+    </section>
+  </div>
+
+  <div class="cols">
+    <div class="card">
+      <h3>Busca</h3>
+      <p>Búsquedas reales en GitHub con estrellas y licencia. 37 skills vendorizadas de 9 repositorios, más 2 propias.</p>
+    </div>
+    <div class="card">
+      <h3>Activa</h3>
+      <p>Las skills viven en <code>.claude/skills/</code>: se descubren solas y se activan cuando la tarea coincide.</p>
+    </div>
+    <div class="card">
+      <h3>Recuerda</h3>
+      <p>Perfil, decisiones y conocimiento quedan en <code>memory/memory.jsonl</code> con el skill <code>memory</code>.</p>
+    </div>
+    <div class="card">
+      <h3>Produce</h3>
+      <p>Del brief al MP4: pipeline de 7 pasos, valores de timing por defecto y matriz de entregables.</p>
+    </div>
+  </div>
+
+  <footer>
+    <span>MIT · skills de terceros con su licencia original (ver CREDITS.md)</span>
+    <span class="spacer"></span>
+    <span>2026 · hecho en el repo, no en el chat</span>
+  </footer>
+</div>
+<script>
+  // El número de skills se cuenta en vivo desde el índice del repo cuando se sirve con un servidor
+  fetch('.claude/skills/').then(r => r.text()).then(html => {
+    const n = (html.match(/href="[^"?][^"]*\/"/g) || []).length;
+    if (n > 10) document.getElementById('n-skills').textContent = n;
+  }).catch(() => {});
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+# ─── Artefactos de render / export ───────────────────────────────────────────
+frames/
+renders/
+out/
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.wav
+*.aiff
+*.flac
+# (las imágenes de documentación sí se versionan; los videos no)
+
+# ─── Dependencias y cachés ──────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+.npm/
+.cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ─── Temporales y sistema ───────────────────────────────────────────────────
+*.log
+.DS_Store
+Thumbs.db
+.tmp/
+tmp/
+
+# ─── Entorno ────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
