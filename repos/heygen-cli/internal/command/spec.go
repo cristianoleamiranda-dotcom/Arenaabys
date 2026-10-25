@@ -1,0 +1,343 @@
+package command
+
+import (
+	"fmt"
+	"net/url"
+	"slices"
+	"strconv"
+
+	clierrors "github.com/heygen-com/heygen-cli/internal/errors"
+	"github.com/spf13/cobra"
+)
+
+// Groups maps group name → list of command specs in that group.
+// This is the output of the codegen grouper and the input to the
+// renderer and the runtime command builder.
+//
+//	groups["video"] = []*Spec{videoList, videoGet, videoCreate, videoDelete}
+type Groups map[string][]*Spec
+
+// SortedNames returns group names in alphabetical order for deterministic output.
+func (g Groups) SortedNames() []string {
+	names := make([]string, 0, len(g))
+	for name := range g {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// Spec is the generated, immutable definition of a CLI command.
+// Codegen produces these from the OpenAPI spec. The builder converts
+// them into Cobra commands; the executor reads the HTTP identity and
+// behavioral fields when executing a request.
+//
+// Example (generated):
+//
+//	var VideoList = &command.Spec{
+//	    Group: "video", Name: "list", Summary: "List videos",
+//	    Endpoint: "/v3/videos", Method: "GET",
+//	    Paginated: true,
+//	    Flags: []command.FlagSpec{{Name: "limit", Type: "int", Source: "query", JSONName: "limit"}},
+//	}
+type Spec struct {
+	// CLI presentation (used by builder, ignored by executor)
+	Group          string     // parent command group ("video")
+	Name           string     // subcommand name ("list")
+	Summary        string     // cobra.Command.Short
+	Description    string     // cobra.Command.Long
+	Args           []ArgSpec  // positional arguments
+	Flags          []FlagSpec // CLI flags (from query params + body fields)
+	Examples       []string   // usage examples shown in --help; mandatory for every command
+	RequestSchema  string     // underlying API request body JSON schema for --request-schema
+	ResponseSchema string     // underlying API response JSON schema for --response-schema
+
+	// HTTP identity (used by executor)
+	Endpoint     string // "/v3/videos/{video_id}" — template with placeholders
+	Method       string // "GET", "POST", "PUT", "PATCH", "DELETE"
+	BodyEncoding string // "json", "multipart", or "" (no body). Builder adds -d/--data when "json".
+
+	// Execution behavior (used by executor)
+	Paginated   bool        // true → command supports cursor pagination via API query flags like --token/--limit
+	PollConfig  *PollConfig // non-nil → pollable; defines polling behavior for --wait
+	Destructive bool        // true → command registers --force and prompts before destructive execution
+	Columns     []Column    // TUI table column definitions for --human output
+}
+
+// ArgSpec defines a positional argument derived from a URL path parameter.
+// Every positional arg maps to a path template variable for URL substitution.
+//
+// Example: heygen video get <video-id> → PathParams["video_id"] = "abc123"
+//
+// Body fields and file paths are always flags (--flag), never positional.
+// This is an agent-first design — named flags are self-documenting.
+type ArgSpec struct {
+	Name  string // display name, kebab-case ("video-id")
+	Param string // path template variable ("video_id")
+	Help  string
+}
+
+// FlagSpec defines a named CLI flag (--name value). Source determines
+// where the resolved value is routed:
+//
+//   - "query":  → inv.QueryParams     (e.g., --limit 10)
+//   - "body":   → inv.Body            (e.g., --title "Hello")
+//   - "file":   → inv.FilePath        (e.g., --file ./video.mp4, for multipart upload)
+//   - "header": → inv.Headers         (e.g., --idempotency-key <uuid>)
+type FlagSpec struct {
+	Name     string   // kebab-case ("folder-id")
+	Type     string   // "string", "int", "bool", "float64", "string-slice"
+	Default  string   // default value as string
+	Help     string   // from OpenAPI description
+	Required bool     // from OpenAPI required
+	Enum     []string // from OpenAPI enum (empty = any value)
+	Min      *int     // from OpenAPI minimum (nil if not defined)
+	Max      *int     // from OpenAPI maximum (nil if not defined)
+	Source   string   // "query", "body", "file", or "header"
+	JSONName string   // original API parameter/field name ("folder_id")
+
+	// Deprecated mirrors OpenAPI `deprecated` on the parameter or schema
+	// property. The flag is still registered and still works — removing it
+	// would break scripts that already pass it — but it is hidden from help
+	// so the CLI stops advertising it, and using it prints a notice.
+	//
+	// Deprecated does not imply the field is ignored by the API. Some
+	// deprecated fields are live aliases (brand_voice_id resolves to
+	// brand_glossary_id); others are true no-ops (enable_caption, now that
+	// captions are always generated). The spec draws no distinction, so
+	// neither does the notice.
+	Deprecated bool
+
+	// SendDefaultWhenOmitted tells BuildInvocation to materialize the flag's
+	// Default into the request even when the user didn't pass the flag —
+	// but only as a non-destructive fill. If a value for this field already
+	// exists in the body (typically because the user supplied it via
+	// -d/--data JSON), the existing value is preserved.
+	//
+	// Set by codegen ONLY when the schema property carries x-cli-default in
+	// the OpenAPI spec — i.e. an explicit, CLI-specific default that diverges
+	// from the server's default. Ordinary OpenAPI ``default`` values keep the
+	// existing omit-unless-changed semantics, so the CLI does not start echoing
+	// every server default back in every request.
+	//
+	// Example: aspect_ratio's API default is "16:9" but x-cli-default is "auto".
+	// Without SendDefaultWhenOmitted, omitting --aspect-ratio would send no
+	// aspect_ratio at all, and the API would apply "16:9" — making the CLI's
+	// "auto" default a help-text-only fiction. With the non-destructive
+	// semantics, ``--data {"aspect_ratio":"16:9"}`` still wins when the flag
+	// itself is omitted.
+	SendDefaultWhenOmitted bool
+}
+
+// PollConfig defines how --wait polling works for async commands.
+// Registered per-command in cmd/heygen/poll_configs.go.
+type PollConfig struct {
+	StatusEndpoint string   // GET endpoint to check status
+	StatusField    string   // JSON field containing status (e.g., "status")
+	TerminalOK     []string // success states: ["completed"]
+	TerminalFail   []string // failure states: ["failed", "error"]
+	IDField        string   // field in create response containing the resource ID
+	HintCommand    string   // CLI get command for manual follow-up (e.g. "video get")
+}
+
+// Column defines a TUI table column for --human output.
+// Curated per-command in cmd/heygen/columns.go.
+type Column struct {
+	Header string // table column header ("Status")
+	Field  string // JSON field path, supports dot notation ("avatar.name")
+	Width  int    // optional fixed width (0 = auto-size)
+}
+
+// Invocation holds the per-invocation resolved values — what the user
+// actually provided. Built fresh by the builder each time a command runs.
+type Invocation struct {
+	PathParams  map[string]string // resolved path parameters
+	QueryParams url.Values        // resolved query parameters (stdlib type, handles repeated keys)
+	Body        map[string]any    // merged from flags + -d/--data; nil means no body sent
+	FilePath    string            // local file path for multipart upload
+	Headers     map[string]string // request headers from header-sourced flags; keyed by wire name
+}
+
+// BuildInvocation resolves positional args and flags from a Cobra command
+// into an Invocation. The merge order is:
+//  1. -d/--data (base, if provided)
+//  2. Positional body args overlay
+//  3. Flag body values overlay (flag wins over -d/--data)
+//
+// -d/--data is the escape hatch for complex request bodies that can't be
+// expressed as CLI flags (discriminated unions, nested objects, arrays of
+// objects). It accepts inline JSON, a file path, or stdin. When used with
+// individual flags, the flags overlay specific fields on top of the JSON base.
+// This enables reusable JSON templates with per-invocation flag tweaks.
+func (s *Spec) BuildInvocation(cmd *cobra.Command, args []string, data map[string]any) (*Invocation, error) {
+	inv := &Invocation{
+		PathParams:  make(map[string]string),
+		QueryParams: make(url.Values),
+	}
+
+	// Step 1: -d/--data as base (if provided)
+	if data != nil {
+		inv.Body = data
+	}
+
+	// Step 2: Positional args → path params
+	for i, arg := range s.Args {
+		if i >= len(args) {
+			break
+		}
+		inv.PathParams[arg.Param] = args[i] //nolint:gosec // G602: i is bounded by range over s.Args and len(args) guard above
+	}
+
+	// Step 3: Flags — explicitly set by the user, OR carrying a CLI-specific
+	// default (SendDefaultWhenOmitted) that must reach the server even when
+	// the flag is omitted.
+	//
+	// The user-changed and default-fill paths are intentionally similar once
+	// the gate passes: in both, the value comes from Cobra's flag store (set
+	// by registerFlag to flag.Default when the user didn't pass the flag), so
+	// a user-supplied flag value naturally wins over a default. The
+	// SendDefaultWhenOmitted branch carves out one additional non-destructive
+	// rule: if -d/--data already provided a value for this body field, that
+	// explicit user value wins over the CLI default. Without that guard,
+	// ``--data {"aspect_ratio":"16:9"}`` with --aspect-ratio omitted would
+	// silently rewrite "16:9" to "auto", which is worse than the bug we're
+	// fixing.
+	for _, flag := range s.Flags {
+		changed := cmd.Flags().Changed(flag.Name)
+		if !changed && !flag.SendDefaultWhenOmitted {
+			continue
+		}
+
+		// Non-destructive default fill: when the user didn't pass the flag
+		// and the default would have overwritten an explicit -d/--data value
+		// for the same JSON field, skip writing. Only applies to body
+		// fields; query params and file uploads don't share with --data.
+		if !changed && flag.SendDefaultWhenOmitted && flag.Source == "body" && inv.Body != nil {
+			if _, exists := inv.Body[flag.JSONName]; exists {
+				continue
+			}
+		}
+
+		if err := validateFlag(cmd, flag); err != nil {
+			return nil, err
+		}
+
+		switch flag.Source {
+		case "query":
+			if flag.Type == "string-slice" {
+				// Repeatable query param: emit one key per value (?type=image&type=icon,
+				// style=form/explode=true). getFlagAsString can't express this (a single
+				// string), and GetString on a slice flag returns "", which silently drops
+				// the filter. GetStringSlice also splits a comma form, so both
+				// `--type image,icon` and `--type image --type icon` expand the same way.
+				vals, _ := cmd.Flags().GetStringSlice(flag.Name)
+				for _, v := range vals {
+					inv.QueryParams.Add(flag.JSONName, v)
+				}
+			} else {
+				inv.QueryParams.Add(flag.JSONName, getFlagAsString(cmd, flag))
+			}
+		case "body":
+			if inv.Body == nil {
+				inv.Body = make(map[string]any)
+			}
+			inv.Body[flag.JSONName] = getFlagValue(cmd, flag)
+		case "header":
+			if inv.Headers == nil {
+				inv.Headers = make(map[string]string)
+			}
+			inv.Headers[flag.JSONName] = getFlagAsString(cmd, flag)
+		case "file":
+			v, _ := cmd.Flags().GetString(flag.Name)
+			inv.FilePath = v
+		}
+	}
+
+	return inv, nil
+}
+
+// validateFlag checks enum membership and min/max bounds.
+func validateFlag(cmd *cobra.Command, flag FlagSpec) error {
+	if len(flag.Enum) > 0 {
+		if flag.Type == "string-slice" {
+			vals, _ := cmd.Flags().GetStringSlice(flag.Name)
+			for _, val := range vals {
+				if !slices.Contains(flag.Enum, val) {
+					return clierrors.NewUsage(
+						fmt.Sprintf("--%s value %q must be one of %v", flag.Name, val, flag.Enum))
+				}
+			}
+		} else {
+			val, _ := cmd.Flags().GetString(flag.Name)
+			if !slices.Contains(flag.Enum, val) {
+				return clierrors.NewUsage(
+					fmt.Sprintf("--%s must be one of %v, got %q", flag.Name, flag.Enum, val))
+			}
+		}
+	}
+
+	if flag.Type == "int" && (flag.Min != nil || flag.Max != nil) {
+		val, _ := cmd.Flags().GetInt(flag.Name)
+		if flag.Min != nil && val < *flag.Min {
+			return clierrors.NewUsage(
+				fmt.Sprintf("--%s must be at least %d, got %d", flag.Name, *flag.Min, val))
+		}
+		if flag.Max != nil && val > *flag.Max {
+			return clierrors.NewUsage(
+				fmt.Sprintf("--%s must be at most %d, got %d", flag.Name, *flag.Max, val))
+		}
+	}
+
+	if flag.Type == "float64" && (flag.Min != nil || flag.Max != nil) {
+		val, _ := cmd.Flags().GetFloat64(flag.Name)
+		if flag.Min != nil && val < float64(*flag.Min) {
+			return clierrors.NewUsage(
+				fmt.Sprintf("--%s must be at least %d, got %v", flag.Name, *flag.Min, val))
+		}
+		if flag.Max != nil && val > float64(*flag.Max) {
+			return clierrors.NewUsage(
+				fmt.Sprintf("--%s must be at most %d, got %v", flag.Name, *flag.Max, val))
+		}
+	}
+
+	return nil
+}
+
+// getFlagAsString reads a flag value as a string for query params.
+func getFlagAsString(cmd *cobra.Command, flag FlagSpec) string {
+	switch flag.Type {
+	case "int":
+		v, _ := cmd.Flags().GetInt(flag.Name)
+		return strconv.Itoa(v)
+	case "bool":
+		v, _ := cmd.Flags().GetBool(flag.Name)
+		return strconv.FormatBool(v)
+	case "float64":
+		v, _ := cmd.Flags().GetFloat64(flag.Name)
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		v, _ := cmd.Flags().GetString(flag.Name)
+		return v
+	}
+}
+
+// getFlagValue reads a flag value with its proper Go type for body fields.
+func getFlagValue(cmd *cobra.Command, flag FlagSpec) any {
+	switch flag.Type {
+	case "int":
+		v, _ := cmd.Flags().GetInt(flag.Name)
+		return v
+	case "bool":
+		v, _ := cmd.Flags().GetBool(flag.Name)
+		return v
+	case "float64":
+		v, _ := cmd.Flags().GetFloat64(flag.Name)
+		return v
+	case "string-slice":
+		v, _ := cmd.Flags().GetStringSlice(flag.Name)
+		return v
+	default:
+		v, _ := cmd.Flags().GetString(flag.Name)
+		return v
+	}
+}

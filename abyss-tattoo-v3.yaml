@@ -1,0 +1,117 @@
+project:
+  name: Abyss Tattoo Studio v3
+  phase: Hero 3D / dirección visual / motion
+
+direction:
+  concept: "Brutalismo editorial + fotografía documental + lujo oscuro"
+  tone:
+    - dark
+    - cinematic
+    - authentic
+    - editorial
+    - premium
+
+palette:
+  abyss_black: "#050505"
+  charcoal: "#161616"
+  bone: "#E8E4DD"
+  dark_gold: "#8A642B"
+  primary_gold: "#C49A50"
+  studio_green: "#596047"
+
+gold:
+  treatment: "oro envejecido, ligeramente quemado"
+  usage:
+    - logo
+    - ABYSS
+    - línea de apertura
+    - CTA
+    - microdetalles editoriales
+    - reflejos controlados
+  never: "amarillo brillante o efecto casino"
+
+photography_policy:
+  priority: "fotografía real"
+  tattoo:
+    immutable: true
+    never:
+      - redibujar
+      - regenerar
+      - completar con IA
+      - alterar líneas
+      - cambiar tinta
+      - deformar
+      - reinterpretar
+  allowed_photo_editing:
+    - exposición
+    - brillo
+    - contraste
+    - profundidad
+    - grano
+    - color grading
+    - separación de planos
+    - máscaras
+    - parallax
+    - desenfoque ambiental
+    - iluminación ambiental
+
+hero_3d:
+  principle: "El tatuaje permanece real. La fotografía gana profundidad. El espacio cobra vida."
+  style: "pseudo-3D / 2.5D cinematográfico"
+  layers:
+    - background
+    - studio_environment
+    - atmospheric_light
+    - photographic_subject
+    - foreground
+    - ABYSS_typography
+    - gold_graphics
+    - micro_atmosphere
+    - UI
+
+motion:
+  intro:
+    - black
+    - vertical_gold_line
+    - photographic_mask_reveal
+    - depth_reveal
+    - ABYSS_3D
+    - gold_light_pass
+    - services
+    - manifesto
+    - CTA
+  interactive:
+    - subtle_pointer_parallax
+    - virtual_camera_motion
+    - opposite_typography_motion
+    - static_or_subtle_grain
+    - magnetic_CTA
+  scroll:
+    - camera_push
+    - ABYSS_scale
+    - photographic_depth
+    - natural_transition_to_black
+    - THE_STUDIO
+  accessibility:
+    reduced_motion: true
+
+hero_copy:
+  brand: "ABYSS"
+  descriptor: "TATTOO STUDIO"
+  services: "TATTOO • PIERCING • ART"
+  manifesto:
+    - "TU CUERPO."
+    - "TU HISTORIA."
+    - "TU RITUAL."
+  cta: "RESERVA TU SESIÓN →"
+
+avoid:
+  - aggressive_glitch
+  - fake_tattoo_generation
+  - blood
+  - fire
+  - animated_skulls
+  - excessive_ink_splashes
+  - gaming_visual_language
+  - excessive_3D
+  - generic_tattoo_template_style

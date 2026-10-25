@@ -1,0 +1,39 @@
+version: 2
+project_name: heygen
+builds:
+  - id: heygen
+    main: ./cmd/heygen/
+    binary: heygen
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Tag}}
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+snapshot:
+  version_template: "{{ .Tag }}-next"
+release:
+  prerelease: auto
+  # The workflow's publish-release job publishes it, so a failed run only ever
+  # leaves a draft for cleanup-failed-release.sh to delete.
+  draft: true
+  # Marks the draft as this run's; publish and cleanup act only on drafts that
+  # carry it. Replacing the notes after publishing drops it, which is fine.
+  header: "<!-- release-run: {{ envOrDefault \"GITHUB_RUN_ID\" \"local\" }} -->"
+checksum:
+  name_template: checksums.txt

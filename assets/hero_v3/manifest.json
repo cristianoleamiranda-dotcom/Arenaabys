@@ -1,0 +1,68 @@
+{
+  "project": "Abyss Tattoo Studio v3",
+  "phase": "Hero 3D / dirección visual / motion",
+  "principle": "El tatuaje permanece real. La fotografía gana profundidad. El espacio cobra vida.",
+  "tattoo_immutable": true,
+  "plates": [
+    {
+      "id": "p01_ritual",
+      "title": "01 / EL RITUAL · SESIÓN EN CURSO",
+      "subtitle": "Fotografía documental real · Hombro blackwork en ejecución · Aguja y guante en primer plano",
+      "source": "assets/trabajos/proceso_hombro.jpg",
+      "width": 900,
+      "height": 1200,
+      "layers": {
+        "background": "assets/hero_v3/p01_ritual_bg.webp",
+        "studio_environment": "assets/hero_v3/p01_ritual_studio.webp",
+        "photographic_subject": "assets/hero_v3/p01_ritual_subject.webp",
+        "foreground": "assets/hero_v3/p01_ritual_foreground.webp",
+        "depth": "assets/hero_v3/p01_ritual_depth.webp"
+      }
+    },
+    {
+      "id": "p02_blackwork",
+      "title": "02 / BLACKWORK · OBRA EN PIEL",
+      "subtitle": "Fotografía documental real · Pieza completa en hombro y brazo · Estudio San Bernardo",
+      "source": "assets/trabajos/craneo.jpg",
+      "width": 900,
+      "height": 1200,
+      "layers": {
+        "background": "assets/hero_v3/p02_blackwork_bg.webp",
+        "studio_environment": "assets/hero_v3/p02_blackwork_studio.webp",
+        "photographic_subject": "assets/hero_v3/p02_blackwork_subject.webp",
+        "foreground": "assets/hero_v3/p02_blackwork_foreground.webp",
+        "depth": "assets/hero_v3/p02_blackwork_depth.webp"
+      }
+    },
+    {
+      "id": "p03_maestro",
+      "title": "03 / EL MAESTRO · PRECISIÓN EN VIVO",
+      "subtitle": "Fotografía documental real · José Joaquín Pérez 528, San Bernardo · Autorizado Seremi",
+      "source": "assets/estudio/maestro.jpg",
+      "width": 768,
+      "height": 1365,
+      "layers": {
+        "background": "assets/hero_v3/p03_maestro_bg.webp",
+        "studio_environment": "assets/hero_v3/p03_maestro_studio.webp",
+        "photographic_subject": "assets/hero_v3/p03_maestro_subject.webp",
+        "foreground": "assets/hero_v3/p03_maestro_foreground.webp",
+        "depth": "assets/hero_v3/p03_maestro_depth.webp"
+      }
+    },
+    {
+      "id": "p04_realismo",
+      "title": "04 / REALISMO · BLACK & GREY",
+      "subtitle": "Fotografía documental real · Textura de piel y sombreado intactos sin alteración IA",
+      "source": "assets/trabajos/trabajo_hombro_real.jpg",
+      "width": 900,
+      "height": 1200,
+      "layers": {
+        "background": "assets/hero_v3/p04_realismo_bg.webp",
+        "studio_environment": "assets/hero_v3/p04_realismo_studio.webp",
+        "photographic_subject": "assets/hero_v3/p04_realismo_subject.webp",
+        "foreground": "assets/hero_v3/p04_realismo_foreground.webp",
+        "depth": "assets/hero_v3/p04_realismo_depth.webp"
+      }
+    }
+  ]
+}

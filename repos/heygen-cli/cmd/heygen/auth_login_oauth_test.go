@@ -1,0 +1,1332 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/heygen-com/heygen-cli/internal/analytics"
+	"github.com/heygen-com/heygen-cli/internal/auth"
+	"github.com/heygen-com/heygen-cli/internal/auth/oauth"
+	"github.com/heygen-com/heygen-cli/internal/command"
+	"github.com/heygen-com/heygen-cli/internal/config"
+	clierrors "github.com/heygen-com/heygen-cli/internal/errors"
+	"github.com/spf13/cobra"
+)
+
+// errorFormatter is a test double for output.Formatter whose Data call
+// always fails, simulating e.g. a broken-pipe stdout write (piping the
+// CLI's output through something that closes early, like `head -1`).
+// Used to confirm that a formatter failure on the success path is
+// reflected in login telemetry: the attempt must NOT be recorded as
+// AuthLoginCompleted if the CLI itself exits non-zero.
+type errorFormatter struct{}
+
+func (errorFormatter) Data(_ json.RawMessage, _ string, _ []command.Column) error {
+	return errors.New("write: broken pipe")
+}
+
+func (errorFormatter) Error(_ *clierrors.CLIError) {}
+
+func (errorFormatter) Warn(_ string)      {}
+func (errorFormatter) Notice(_, _ string) {}
+
+// fakeIdP serves a minimal subset of the HeyGen OAuth endpoints for the
+// PR 2 login integration test. It accepts a single authorization_code
+// exchange and returns a fixed token response.
+type fakeIdP struct {
+	server         *httptest.Server
+	expectedCode   string
+	expectedClient string
+	tokenResponse  string
+	tokenStatus    int
+	gotForm        url.Values
+}
+
+func newFakeIdP(t *testing.T) *fakeIdP {
+	t.Helper()
+	idp := &fakeIdP{
+		expectedCode:   "test_code_abc",
+		expectedClient: oauth.DefaultClientID,
+		tokenStatus:    http.StatusOK,
+		tokenResponse:  `{"access_token":"at_minted","refresh_token":"rt_minted","token_type":"Bearer","expires_in":3600,"scope":"openid profile"}`,
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/oauth/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		idp.gotForm = r.PostForm
+		if r.PostForm.Get("grant_type") != "authorization_code" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostForm.Get("code") != idp.expectedCode {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostForm.Get("client_id") != idp.expectedClient {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.PostForm.Get("code_verifier") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(idp.tokenStatus)
+		_, _ = w.Write([]byte(idp.tokenResponse))
+	})
+	idp.server = httptest.NewServer(mux)
+	t.Cleanup(idp.server.Close)
+	return idp
+}
+
+// fakeUsersMeServer returns the /v3/users/me payload used to populate
+// the "Logged in as ..." line.
+func fakeUsersMeServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v3/users/me" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// hitBrowserCallback is the "browser" — we simulate the IdP redirecting
+// the user back to 127.0.0.1:<port>/oauth/callback with the captured
+// state + a canned code. The test inspects authURL to extract the state
+// + redirect_uri so the callback round-trips correctly.
+func hitBrowserCallback(t *testing.T, code, authURL string) {
+	t.Helper()
+	parsed, err := url.Parse(authURL)
+	if err != nil {
+		t.Fatalf("parse authURL: %v", err)
+	}
+	q := parsed.Query()
+	redirectURI := q.Get("redirect_uri")
+	state := q.Get("state")
+	if redirectURI == "" || state == "" {
+		t.Fatalf("authURL missing redirect_uri/state: %s", authURL)
+	}
+	callbackURL := redirectURI + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	req, err := http.NewRequest("GET", callbackURL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	// Use a fresh client so we don't share idle keep-alive sockets with
+	// the test's other servers.
+	c := &http.Client{Timeout: 5 * time.Second}
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("hit callback: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("callback returned %d", resp.StatusCode)
+	}
+}
+
+// TestAuthLogin_OAuthFlow_PersistsTokens is the end-to-end integration
+// test for the loopback ← callback ← exchange chain. It uses an
+// httptest fake IdP for token exchange and an httptest /v3/users/me for
+// the identity probe.
+func TestAuthLogin_OAuthFlow_PersistsTokens(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo","email":"demo@example.com"}}`)
+
+	// Stub the browser: instead of spawning the OS browser, we synthesize
+	// the redirect ourselves. The login command will block on the
+	// loopback callback channel, so we kick off the synthesized callback
+	// in a goroutine.
+	cfg := oauthLoginConfig{
+		AuthorizeURL: "http://127.0.0.1:1/oauth/authorize", // unused — we never visit it
+		TokenURL:     idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				// Tiny delay so the loopback server's Accept() loop is
+				// up before we connect.
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s\nstdout: %s", res.ExitCode, res.Stderr, res.Stdout)
+	}
+
+	// Token block must be persisted with the IdP's response.
+	tok, err := auth.LoadOAuthTokens()
+	if err != nil {
+		t.Fatalf("LoadOAuthTokens: %v", err)
+	}
+	if tok.AccessToken != "at_minted" {
+		t.Errorf("access_token = %q, want at_minted", tok.AccessToken)
+	}
+	if tok.RefreshToken != "rt_minted" {
+		t.Errorf("refresh_token = %q, want rt_minted", tok.RefreshToken)
+	}
+	if tok.Scope != "openid profile" {
+		t.Errorf("scope = %q, want %q", tok.Scope, "openid profile")
+	}
+	if time.Until(tok.ExpiresAt) <= 0 {
+		t.Errorf("expires_at = %v, want future", tok.ExpiresAt)
+	}
+
+	// File permissions must be 0600 on Unix (same as api-key path).
+	// Windows NTFS does not honor POSIX permission bits, so the assert
+	// only applies elsewhere.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(configDir, "credentials"))
+		if err != nil {
+			t.Fatalf("Stat: %v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("perms = %o, want 0600", perm)
+		}
+	}
+
+	// Stderr should mention "Logged in as demo@example.com" — the
+	// friendly-display change prefers email over username so the
+	// status line surfaces a recognizable identity rather than an
+	// opaque handle. (Falls back to "first last" then username.)
+	if !strings.Contains(res.Stderr, "Logged in as demo@example.com") {
+		t.Errorf("stderr = %q, want 'Logged in as demo@example.com'", res.Stderr)
+	}
+
+	// Stdout JSON should expose the credential metadata so callers can
+	// pipe to jq.
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(res.Stdout), &parsed); err != nil {
+		t.Fatalf("stdout not JSON: %v\n%s", err, res.Stdout)
+	}
+	if parsed["scope"] != "openid profile" {
+		t.Errorf("stdout.scope = %v, want %q", parsed["scope"], "openid profile")
+	}
+}
+
+// TestAuthLogin_OAuthFlow_TokenExchangeRejected: the IdP returns 400
+// on the exchange step. The CLI surfaces it as a clear error and does
+// NOT persist anything.
+func TestAuthLogin_OAuthFlow_TokenExchangeRejected(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	idp.tokenStatus = http.StatusBadRequest
+	idp.tokenResponse = `{"error":"invalid_grant"}`
+
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+	}
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode == 0 {
+		t.Fatalf("expected non-zero exit, got 0\nstderr: %s\nstdout: %s", res.Stderr, res.Stdout)
+	}
+	if _, err := auth.LoadOAuthTokens(); err == nil {
+		t.Error("tokens were persisted despite exchange failure")
+	}
+}
+
+// TestAuthLogin_APIKeyFlag_StillSavesKey is a regression test for the
+// --api-key flag path now that browser OAuth is the default.
+func TestAuthLogin_APIKeyFlag_StillSavesKey(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", dir)
+
+	res := runCommandWithInput(t, "http://example.invalid", "", strings.NewReader("hg_xyz\n"),
+		"auth", "login", "--api-key")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "credentials"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), `"hg_xyz"`) {
+		t.Fatalf("creds file = %s, want hg_xyz", string(data))
+	}
+}
+
+// TestAuthLogin_APIKeyFlow_ClearsPreviousOAuth verifies the
+// single-credential normalization invariant on the api-key path:
+// when an OAuth block is already on disk (pre-this-change user, or
+// a user who logged in via OAuth previously), running
+// `heygen auth login --api-key <newkey>` must drop the OAuth block
+// so the file holds at most one of api_key / oauth.
+func TestAuthLogin_APIKeyFlow_ClearsPreviousOAuth(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", dir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	// Seed an OAuth session from a prior login.
+	if err := auth.SaveOAuthTokens(auth.OAuthTokens{
+		AccessToken:  "at_old",
+		RefreshToken: "rt_old",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		Scope:        "openid profile",
+	}); err != nil {
+		t.Fatalf("seed SaveOAuthTokens: %v", err)
+	}
+
+	res := runCommandWithInput(t, "http://example.invalid", "", strings.NewReader("hg_replacement\n"),
+		"auth", "login", "--api-key")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s\nstdout: %s", res.ExitCode, res.Stderr, res.Stdout)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "credentials"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"hg_replacement"`) {
+		t.Fatalf("api_key was not saved: %s", raw)
+	}
+	if strings.Contains(string(raw), `"oauth"`) {
+		t.Fatalf("OAuth block survived api-key login (single-credential invariant violated):\n%s", raw)
+	}
+	// Stdout JSON should report cleared_oauth=true so callers see the
+	// normalization happened.
+	if !strings.Contains(res.Stdout, `"cleared_oauth":true`) {
+		t.Errorf("stdout = %q, want cleared_oauth=true", res.Stdout)
+	}
+}
+
+// TestAuthLogin_APIKeyFlow_NoPriorOAuth_NoMention: when there's no
+// OAuth block to clear, the success message must NOT mention OAuth.
+// Keeps the happy path quiet for users who only ever used api_key.
+func TestAuthLogin_APIKeyFlow_NoPriorOAuth_NoMention(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", dir)
+
+	res := runCommandWithInput(t, "http://example.invalid", "", strings.NewReader("hg_first\n"),
+		"auth", "login", "--api-key")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+	if strings.Contains(res.Stdout, "OAuth") || strings.Contains(res.Stdout, "oauth") {
+		// The boolean field "cleared_oauth":false is fine; we want to
+		// ensure the human-readable message doesn't ramble about
+		// OAuth when there was nothing to clear.
+		if !strings.Contains(res.Stdout, `"cleared_oauth":false`) ||
+			strings.Contains(res.Stdout, "cleared previously-stored OAuth") {
+			t.Errorf("stdout mentions OAuth for an OAuth-less first login: %s", res.Stdout)
+		}
+	}
+}
+
+// TestAuthLogin_OAuthFlow_ClearsPreviousAPIKey verifies the same
+// invariant on the OAuth path: a successful browser login drops any
+// co-located api_key block. Pre-this-change users with both blocks
+// self-heal on their next login.
+func TestAuthLogin_OAuthFlow_ClearsPreviousAPIKey(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	// Seed an api_key from a prior login.
+	store := &auth.FileCredentialStore{}
+	if err := store.Save("hg_legacy"); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo","email":"demo@example.com"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s\nstdout: %s", res.ExitCode, res.Stderr, res.Stdout)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(configDir, "credentials"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(raw), `"hg_legacy"`) {
+		t.Fatalf("api_key survived OAuth login (single-credential invariant violated):\n%s", raw)
+	}
+	if !strings.Contains(string(raw), `"access_token"`) {
+		t.Fatalf("oauth block missing after OAuth login:\n%s", raw)
+	}
+	if !strings.Contains(res.Stdout, `"cleared_api_key":true`) {
+		t.Errorf("stdout = %q, want cleared_api_key=true", res.Stdout)
+	}
+}
+
+// TestAuthLogin_CredentialConflict_SelfHeals walks the full
+// "pre-this-change user with both blocks" scenario end-to-end:
+//
+//  1. seed a file with both api_key + oauth (legacy state from a
+//     prior CLI version),
+//  2. run `auth status` — must report api_key (per C2 precedence),
+//  3. run `auth login --api-key <newkey>` — must save the new key
+//     AND drop the OAuth block (per C3 normalization),
+//  4. final file must hold only an api_key, no oauth section.
+func TestAuthLogin_CredentialConflict_SelfHeals(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", dir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	// Seed both blocks via the legacy round-trip (Save then SaveOAuth
+	// — Save preserves a co-located oauth block, so this is the same
+	// file shape an old version would produce).
+	store := &auth.FileCredentialStore{}
+	if err := store.Save("hg_legacy"); err != nil {
+		t.Fatalf("seed Save: %v", err)
+	}
+	if err := auth.SaveOAuthTokens(auth.OAuthTokens{
+		AccessToken:  "at_legacy",
+		RefreshToken: "rt_legacy",
+		ExpiresAt:    time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("seed SaveOAuthTokens: %v", err)
+	}
+
+	// (2) Resolver must select api_key under the new precedence.
+	r := &auth.FileCredentialResolver{}
+	cred, err := r.ResolveCredential()
+	if err != nil {
+		t.Fatalf("ResolveCredential: %v", err)
+	}
+	if cred.APIKey != "hg_legacy" {
+		t.Fatalf("legacy file: resolved cred = %+v, want APIKey hg_legacy", cred)
+	}
+
+	// (3) Next api-key login must drop the OAuth block.
+	res := runCommandWithInput(t, "http://example.invalid", "", strings.NewReader("hg_new\n"),
+		"auth", "login", "--api-key")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	// (4) Final file holds only api_key, no oauth.
+	raw, err := os.ReadFile(filepath.Join(dir, "credentials"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"hg_new"`) {
+		t.Fatalf("new api_key missing: %s", raw)
+	}
+	if strings.Contains(string(raw), `"oauth"`) {
+		t.Fatalf("oauth block survived conflict self-heal:\n%s", raw)
+	}
+}
+
+// TestAuthLogin_DeviceCodeCompatibilityAlias keeps the pre-release
+// --device-code spelling working while the public help uses --device.
+func TestAuthLogin_DeviceCodeCompatibilityAlias(t *testing.T) {
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	spy := &dispatchSpy{}
+	runAuthLoginTestDeps = spy.deps()
+	t.Cleanup(func() { runAuthLoginTestDeps = nil })
+
+	res := runCommandWithInput(t, "http://example.invalid", "", strings.NewReader(""),
+		"auth", "login", "--device-code")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0; stderr=%s", res.ExitCode, res.Stderr)
+	}
+	if spy.deviceCalls != 1 {
+		t.Fatalf("deviceCalls = %d, want 1", spy.deviceCalls)
+	}
+}
+
+// W4: when cfg.UsersMeBaseURL is empty (production path), the login
+// identity probe must read HEYGEN_API_BASE from the config provider
+// instead of hardcoding https://api.heygen.com. Without this, pointing
+// the CLI at a dev sandbox silently fans the probe out to prod.
+func TestAuthLogin_OAuthFlow_HonorsHEYGEN_API_BASEForUsersMeProbe(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"sandbox-user","email":"u@example.com"}}`)
+
+	// Pin the CLI's base URL to the test users/me server. This is the
+	// production code path (no cfg.UsersMeBaseURL override) but the
+	// probe should still hit our test server because HEYGEN_API_BASE
+	// directs the config provider there.
+	t.Setenv("HEYGEN_API_BASE", usersMe.URL)
+
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		// Deliberately leave UsersMeBaseURL empty — we want to verify
+		// the production fallback (ctx.configProvider.BaseURL()).
+	}
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s\nstdout: %s", res.ExitCode, res.Stderr, res.Stdout)
+	}
+	// The probe should have hit usersMe.URL (via HEYGEN_API_BASE) and
+	// returned u@example.com. Friendly-display prefers email, so the
+	// status line surfaces the email rather than the username.
+	if !strings.Contains(res.Stderr, "Logged in as u@example.com") {
+		t.Errorf("stderr = %q, want 'Logged in as u@example.com' (probe should have hit %s, not api.heygen.com)", res.Stderr, usersMe.URL)
+	}
+}
+
+// runOAuthLoginForTest builds the auth login command directly with a
+// pinned oauthLoginConfig — runCommand can't pass per-command config
+// hooks, so we drop down a level here.
+func runOAuthLoginForTest(t *testing.T, cfg oauthLoginConfig) cmdResult {
+	t.Helper()
+
+	var stdout, stderr strings.Builder
+	formatter := formatterForArgs([]string{"auth", "login"}, &stdout, &stderr)
+
+	if os.Getenv("HEYGEN_CONFIG_DIR") == "" {
+		t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	}
+	t.Setenv("HEYGEN_NO_ANALYTICS", "1")
+	t.Setenv("HEYGEN_NO_BROWSER", "1") // belt + braces; OpenBrowser is stubbed via cfg anyway
+
+	// Mirror what initContext sets up so runOAuthLogin can fall back to
+	// ctx.configProvider.BaseURL() when cfg.UsersMeBaseURL is empty (W4).
+	ctx := &cmdContext{
+		formatter: formatter,
+		version:   "test",
+		configProvider: &config.LayeredProvider{
+			Env:  &config.EnvProvider{},
+			File: &config.FileProvider{},
+		},
+		client: nil,
+	}
+	_ = analytics.New("test", false)
+
+	cmd := newAuthLoginCmd(ctx)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{})
+
+	// Inject our test config by calling runOAuthLogin directly through
+	// a tweaked default. This keeps the production command unchanged
+	// while letting the test pin endpoints.
+	cmd.RunE = func(c *cobra.Command, args []string) error {
+		return runOAuthLogin(c, ctx, cfg)
+	}
+
+	exitCode := 0
+	if err := cmd.Execute(); err != nil {
+		exitCode = 1
+		_, _ = stderr.WriteString(err.Error())
+	}
+	return cmdResult{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+	}
+}
+
+// N1: explicit `heygen auth login --oauth` in a headless shell (no
+// stdin TTY + HEYGEN_NO_BROWSER=1) must fail fast with a usage error
+// instead of blocking on the loopback callback for ~5min. Test by
+// calling runOAuthLogin directly with cfg.OpenBrowser nil — that's
+// the "production" signal that the test path also lacks injection.
+func TestRunOAuthLogin_HeadlessShell_FailsFast(t *testing.T) {
+	t.Setenv("HEYGEN_NO_BROWSER", "1")
+	t.Setenv("BROWSER", "")
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+
+	// Force stdinIsTerminalFunc to report false — `go test` may attach
+	// a tty even when the harness is non-interactive.
+	orig := stdinIsTerminalFunc
+	stdinIsTerminalFunc = func() bool { return false }
+	t.Cleanup(func() { stdinIsTerminalFunc = orig })
+
+	var stdout, stderr strings.Builder
+	formatter := formatterForArgs([]string{"auth", "login"}, &stdout, &stderr)
+	ctx := &cmdContext{
+		formatter: formatter,
+		version:   "test",
+		configProvider: &config.LayeredProvider{
+			Env:  &config.EnvProvider{},
+			File: &config.FileProvider{},
+		},
+	}
+	_ = analytics.New("test", false)
+	cmd := newAuthLoginCmd(ctx)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+
+	// Production-shape config: NO OpenBrowser injected. That's the
+	// signal the guard uses to fast-fail.
+	cfg := oauthLoginConfig{}
+
+	// Call runOAuthLogin directly so the test doesn't depend on the
+	// flag dispatcher (which also has its own non-interactive fallback
+	// to the API-key path). The N1 guard sits inside runOAuthLogin.
+	start := time.Now()
+	err := runOAuthLogin(cmd, ctx, cfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected headless --oauth to fail fast, got nil")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("runOAuthLogin took %v in a headless shell; must fast-fail (N1)", elapsed)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "headless") {
+		t.Errorf("error = %q, want a 'headless' hint (N1)", msg)
+	}
+	if !strings.Contains(msg, "--api-key") {
+		t.Errorf("error = %q, want a pointer to --api-key (N1)", msg)
+	}
+}
+
+// U4: the N1 headless-shell fast-fail is reachable through the real
+// dispatcher too — started(oauth) fires (the dispatcher doesn't know about
+// the guard), then failed(oauth, headless_shell) from inside runOAuthLogin.
+func TestRunAuthLogin_OAuthHeadlessShell_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_NO_BROWSER", "1")
+	t.Setenv("BROWSER", "")
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+
+	orig := stdinIsTerminalFunc
+	stdinIsTerminalFunc = func() bool { return false }
+	t.Cleanup(func() { stdinIsTerminalFunc = orig })
+
+	runAuthLoginTestDeps = &runAuthLoginDeps{
+		stdinIsTerminal:  func() bool { return true },
+		stdoutIsTerminal: func() bool { return true },
+		nonInteractive:   func() bool { return false },
+		runOAuth: func(c *cobra.Command, x *cmdContext) error {
+			return runOAuthLogin(c, x, oauthLoginConfig{})
+		},
+	}
+	t.Cleanup(func() { runAuthLoginTestDeps = nil })
+
+	cmd, ctx := makeDispatchCmd(t)
+	err := runAuthLogin(cmd, ctx, authLoginFlags{oauthMode: true})
+	if err == nil {
+		t.Fatal("want headless-shell error, got nil")
+	}
+
+	if got := spy.started; len(got) != 1 || got[0] != "oauth" {
+		t.Fatalf("started = %v, want [oauth]", got)
+	}
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"oauth", "headless_shell"}) {
+		t.Fatalf("failed = %v, want [{oauth headless_shell}]", got)
+	}
+	if len(spy.completed) != 0 {
+		t.Fatalf("completed = %v, want none", spy.completed)
+	}
+}
+
+// U4: a successful --oauth flow driven through the real dispatcher emits
+// started(oauth) then completed(oauth), no failed.
+func TestRunAuthLogin_OAuthSuccess_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo","email":"demo@example.com"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	runAuthLoginTestDeps = &runAuthLoginDeps{
+		stdinIsTerminal:  func() bool { return true },
+		stdoutIsTerminal: func() bool { return true },
+		nonInteractive:   func() bool { return false },
+		runOAuth: func(c *cobra.Command, x *cmdContext) error {
+			return runOAuthLogin(c, x, cfg)
+		},
+	}
+	t.Cleanup(func() { runAuthLoginTestDeps = nil })
+
+	// makeDispatchCmd's bare *cmdContext has a nil formatter — fine for the
+	// stubbed-runner dispatch tests, but runOAuthLogin's success path calls
+	// ctx.formatter.Data(...), so build a real one here (same as
+	// runOAuthLoginForTest).
+	var stdout, stderr strings.Builder
+	formatter := formatterForArgs([]string{"auth", "login"}, &stdout, &stderr)
+	cmd := &cobra.Command{Use: "login"}
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetContext(context.Background())
+	ctx := &cmdContext{formatter: formatter, version: "test"}
+
+	if err := runAuthLogin(cmd, ctx, authLoginFlags{oauthMode: true}); err != nil {
+		t.Fatalf("runAuthLogin: %v", err)
+	}
+
+	if got := spy.started; len(got) != 1 || got[0] != "oauth" {
+		t.Fatalf("started = %v, want [oauth]", got)
+	}
+	if got := spy.completed; len(got) != 1 || got[0] != "oauth" {
+		t.Fatalf("completed = %v, want [oauth]", got)
+	}
+	if len(spy.failed) != 0 {
+		t.Fatalf("failed = %v, want none", spy.failed)
+	}
+}
+
+// Regression test: a login that otherwise succeeds but whose final
+// response write fails (e.g. stdout piped into something that closes
+// early) must NOT be recorded as AuthLoginCompleted — the CLI itself
+// exits non-zero, so telemetry must agree and report AuthLoginFailed
+// instead. Previously runOAuthLogin set reported=true and called
+// AuthLoginCompleted BEFORE calling ctx.formatter.Data, so a formatter
+// failure here still recorded a completed login.
+func TestRunAuthLogin_OAuthFormatterFailure_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo","email":"demo@example.com"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	runAuthLoginTestDeps = &runAuthLoginDeps{
+		stdinIsTerminal:  func() bool { return true },
+		stdoutIsTerminal: func() bool { return true },
+		nonInteractive:   func() bool { return false },
+		runOAuth: func(c *cobra.Command, x *cmdContext) error {
+			return runOAuthLogin(c, x, cfg)
+		},
+	}
+	t.Cleanup(func() { runAuthLoginTestDeps = nil })
+
+	cmd := &cobra.Command{Use: "login"}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	ctx := &cmdContext{formatter: errorFormatter{}, version: "test"}
+
+	err := runAuthLogin(cmd, ctx, authLoginFlags{oauthMode: true})
+	if err == nil {
+		t.Fatal("runAuthLogin: want the formatter error, got nil")
+	}
+	if !strings.Contains(err.Error(), "broken pipe") {
+		t.Fatalf("err = %q, want it to surface the formatter failure", err.Error())
+	}
+
+	if len(spy.completed) != 0 {
+		t.Fatalf("completed = %v, want none (formatter failed after login succeeded)", spy.completed)
+	}
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"oauth", "internal_error"}) {
+		t.Fatalf("failed = %v, want [{oauth internal_error}]", got)
+	}
+}
+
+// U4: the parent context expiring before any browser callback arrives
+// emits failed(oauth, oauth_canceled). A short-deadline parent stands in
+// for Ctrl-C or an agent-imposed timeout; runOAuthLogin derives cmdCtx
+// from cmd.Context(), which honors the parent's earlier deadline. The
+// pure DefaultLoopbackTimeout path (oauth_timeout) is covered by the
+// oauth package's own sentinel tests rather than a ~5min wait here.
+func TestRunOAuthLogin_ParentContextCanceled_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+
+	var stdout, stderr strings.Builder
+	formatter := formatterForArgs([]string{"auth", "login"}, &stdout, &stderr)
+	ctx := &cmdContext{formatter: formatter, version: "test"}
+
+	cmd := &cobra.Command{Use: "login"}
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	parentCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	cmd.SetContext(parentCtx)
+
+	cfg := oauthLoginConfig{
+		// Non-nil OpenBrowser skips the N1 headless-shell guard; it
+		// deliberately never drives the callback, so the loopback times out.
+		OpenBrowser: func(authURL string) error { return nil },
+	}
+
+	err := runOAuthLogin(cmd, ctx, cfg)
+	if err == nil {
+		t.Fatal("want cancellation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "canceled waiting for browser callback") {
+		t.Fatalf("err = %q, want a cancellation message", err.Error())
+	}
+
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"oauth", "oauth_canceled"}) {
+		t.Fatalf("failed = %v, want [{oauth oauth_canceled}]", got)
+	}
+	if len(spy.completed) != 0 {
+		t.Fatalf("completed = %v, want none", spy.completed)
+	}
+}
+
+// U4: the IdP rejecting the authorization code emits
+// failed(oauth, token_rejected), no completed.
+func TestRunOAuthLogin_TokenExchangeFailed_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	idp.tokenStatus = http.StatusBadRequest
+	idp.tokenResponse = `{"error":"invalid_grant"}`
+
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+	}
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode == 0 {
+		t.Fatalf("expected non-zero exit, got 0\nstderr: %s\nstdout: %s", res.Stderr, res.Stdout)
+	}
+
+	// A 400 from the token endpoint is a rejected code, which needs a fresh
+	// login — not the generic bucket, and not a retryable failure.
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"oauth", "token_rejected"}) {
+		t.Fatalf("failed = %v, want [{oauth token_rejected}]", got)
+	}
+	if len(spy.completed) != 0 {
+		t.Fatalf("completed = %v, want none", spy.completed)
+	}
+}
+
+// The end-to-end counterpart to the 400 case above: a 5xx must report as a
+// retryable server error rather than collapsing into the rejected reason.
+func TestRunOAuthLogin_TokenEndpoint5xx_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	idp.tokenStatus = http.StatusInternalServerError
+	idp.tokenResponse = `upstream exploded`
+
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+	}
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode == 0 {
+		t.Fatalf("expected non-zero exit, got 0\nstderr: %s", res.Stderr)
+	}
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"oauth", "token_server_error"}) {
+		t.Fatalf("failed = %v, want [{oauth token_server_error}]", got)
+	}
+}
+
+// U3: a successful OAuth login that resolves an email enqueues
+// Alias{DistinctId: email, Alias: <shared install id>} followed by
+// Identify{DistinctId: email}.
+func TestRunOAuthLogin_IdentifyAccount_Email(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo","email":"demo@example.com"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if got := spy.identifyCalls; len(got) != 1 || got[0] != "demo@example.com" {
+		t.Fatalf("identifyCalls = %v, want [demo@example.com]", got)
+	}
+}
+
+// U3: no email resolved, only a username → IdentifyAccount is keyed on the
+// username instead.
+func TestRunOAuthLogin_IdentifyAccount_UsernameFallback(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"demo"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if got := spy.identifyCalls; len(got) != 1 || got[0] != "demo" {
+		t.Fatalf("identifyCalls = %v, want [demo]", got)
+	}
+}
+
+// identityKey lowercases the resolved email so this joins the same PostHog
+// person regardless of the account's stored casing.
+func TestRunOAuthLogin_IdentifyAccount_EmailLowercased(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	usersMe := fakeUsersMeServer(t, `{"data":{"username":"Demo","email":"Demo@Example.com"}}`)
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: usersMe.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if got := spy.identifyCalls; len(got) != 1 || got[0] != "demo@example.com" {
+		t.Fatalf("identifyCalls = %v, want [demo@example.com]", got)
+	}
+}
+
+// U3: the identity probe failing entirely (login still succeeds per
+// existing behavior) must not call IdentifyAccount.
+func TestRunOAuthLogin_IdentifyAccount_ProbeFailure_NoIdentify(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+	t.Setenv("HEYGEN_API_KEY", "")
+
+	idp := newFakeIdP(t)
+	// /v3/users/me probe: unreachable server → probe fails, login proceeds.
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	unreachable.Close() // closed immediately: connection refused on probe
+
+	cfg := oauthLoginConfig{
+		TokenURL: idp.server.URL + "/v1/oauth/token",
+		OpenBrowser: func(authURL string) error {
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				hitBrowserCallback(t, idp.expectedCode, authURL)
+			}()
+			return nil
+		},
+		UsersMeBaseURL: unreachable.URL,
+		Now:            time.Now,
+	}
+
+	res := runOAuthLoginForTest(t, cfg)
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0 (login must not roll back on probe failure)\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if len(spy.identifyCalls) != 0 {
+		t.Fatalf("identifyCalls = %v, want none (probe failed)", spy.identifyCalls)
+	}
+	// Login still completes despite the identity probe failure.
+	if got := spy.completed; len(got) != 1 || got[0] != "oauth" {
+		t.Fatalf("completed = %v, want [oauth]", got)
+	}
+}
+
+// U3: a successful api-key login resolving an identity emits the same
+// Alias-then-Identify pair as the OAuth path.
+func TestRunAuthLogin_APIKey_IdentifyAccount(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	configDir := t.TempDir()
+	t.Setenv("HEYGEN_CONFIG_DIR", configDir)
+
+	srv, _ := usersMeServerForKey(t, "hg_test_key", `{"data":{"username":"jdoe","email":"jane@example.com"}}`)
+
+	res := runCommandWithInput(t, srv.URL, "", strings.NewReader("hg_test_key\n"),
+		"auth", "login", "--api-key")
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0\nstderr: %s", res.ExitCode, res.Stderr)
+	}
+
+	if got := spy.identifyCalls; len(got) != 1 || got[0] != "jane@example.com" {
+		t.Fatalf("identifyCalls = %v, want [jane@example.com]", got)
+	}
+	if got := spy.completed; len(got) != 1 || got[0] != "api_key" {
+		t.Fatalf("completed = %v, want [api_key]", got)
+	}
+}
+
+// Regression test, api-key path: same as
+// TestRunAuthLogin_OAuthFormatterFailure_Telemetry but through
+// runAPIKeyLogin. A formatter failure on the success path must surface
+// as the function's return error (non-zero exit) AND must be reported
+// as AuthLoginFailed(api_key, internal_error), never
+// AuthLoginCompleted.
+func TestRunAuthLogin_APIKeyFormatterFailure_Telemetry(t *testing.T) {
+	spy := withLoginAnalyticsSpy(t)
+	t.Setenv("HEYGEN_CONFIG_DIR", t.TempDir())
+
+	srv, _ := usersMeServerForKey(t, "hg_test_key", `{"data":{"username":"jdoe","email":"jane@example.com"}}`)
+	t.Setenv("HEYGEN_API_BASE", srv.URL)
+	t.Setenv("HEYGEN_ALLOW_HTTP", "1")
+
+	runAuthLoginTestDeps = &runAuthLoginDeps{
+		stdinIsTerminal:  func() bool { return true },
+		stdoutIsTerminal: func() bool { return true },
+		nonInteractive:   func() bool { return false },
+		runAPIKey:        runAPIKeyLogin,
+	}
+	t.Cleanup(func() { runAuthLoginTestDeps = nil })
+
+	cmd := &cobra.Command{Use: "login"}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetIn(strings.NewReader("hg_test_key\n"))
+	cmd.SetContext(context.Background())
+	ctx := &cmdContext{
+		formatter: errorFormatter{},
+		version:   "test",
+		configProvider: &config.LayeredProvider{
+			Env:  &config.EnvProvider{},
+			File: &config.FileProvider{},
+		},
+	}
+
+	err := runAuthLogin(cmd, ctx, authLoginFlags{apiKeyMode: true})
+	if err == nil {
+		t.Fatal("runAuthLogin: want the formatter error, got nil")
+	}
+	if !strings.Contains(err.Error(), "broken pipe") {
+		t.Fatalf("err = %q, want it to surface the formatter failure", err.Error())
+	}
+
+	if len(spy.completed) != 0 {
+		t.Fatalf("completed = %v, want none (formatter failed after login succeeded)", spy.completed)
+	}
+	if got := spy.failed; len(got) != 1 || got[0] != (loginAnalyticsFailedCall{"api_key", "internal_error"}) {
+		t.Fatalf("failed = %v, want [{api_key internal_error}]", got)
+	}
+}
+
+// Each loopback sentinel must map to its own analytics reason, and
+// anything unrecognized must fall back to the historical bucket rather
+// than dropping out of the series.
+func TestOAuthFailureReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"timeout", oauth.ErrLoopbackTimeout, "oauth_timeout"},
+		{"canceled", oauth.ErrLoopbackCanceled, "oauth_canceled"},
+		{"denied", oauth.ErrAuthorizeDenied, "oauth_authorize_denied"},
+		{"authorize failed", oauth.ErrAuthorizeFailed, "oauth_authorize_failed"},
+		{"state mismatch", oauth.ErrStateMismatch, "oauth_state_mismatch"},
+		{"missing code", oauth.ErrMissingCode, "oauth_missing_code"},
+		{"loopback server", oauth.ErrLoopbackServer, "oauth_loopback_failed"},
+		{"unmapped falls back", errors.New("something new"), "oauth_flow_error"},
+		{"wrapped sentinel still matches", fmt.Errorf("ctx: %w", oauth.ErrLoopbackTimeout), "oauth_timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := oauthFailureReason(tt.err); got != tt.want {
+				t.Errorf("oauthFailureReason(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// The reason set is an analytics dimension, so it must stay a small
+// fixed vocabulary. This pins it: adding a reason is fine, but it has to
+// be a deliberate edit here too.
+func TestOAuthFailureReason_BoundedVocabulary(t *testing.T) {
+	allowed := map[string]bool{
+		"oauth_timeout": true, "oauth_canceled": true,
+		"oauth_authorize_denied": true, "oauth_authorize_failed": true,
+		"oauth_state_mismatch": true, "oauth_missing_code": true,
+		"oauth_loopback_failed": true, "oauth_flow_error": true,
+	}
+	for _, err := range []error{
+		oauth.ErrLoopbackTimeout, oauth.ErrLoopbackCanceled,
+		oauth.ErrAuthorizeDenied, oauth.ErrAuthorizeFailed,
+		oauth.ErrStateMismatch, oauth.ErrMissingCode,
+		oauth.ErrLoopbackServer, errors.New("unmapped"),
+	} {
+		if got := oauthFailureReason(err); !allowed[got] {
+			t.Errorf("oauthFailureReason(%v) = %q, outside the allowed set", err, got)
+		}
+	}
+}
+
+// allowedLoginFailureReasons is the full AUTH_LOGIN_FAILED vocabulary, per
+// method. These are PostHog analytics dimensions, so the set must stay small
+// and fixed; adding one has to be a deliberate edit here too.
+var allowedLoginFailureReasons = map[string]map[string]bool{
+	"oauth": {
+		// Routed through oauthFailureReason.
+		"oauth_timeout": true, "oauth_canceled": true,
+		"oauth_authorize_denied": true, "oauth_authorize_failed": true,
+		"oauth_state_mismatch": true, "oauth_missing_code": true,
+		"oauth_loopback_failed": true, "oauth_flow_error": true,
+		// Routed through tokenFailureReason.
+		"token_rejected": true, "token_canceled": true, "token_network_error": true,
+		"token_server_error": true, "token_http_error": true,
+		"token_rate_limited": true, "token_client_error": true,
+		"token_rejected_unclassified": true,
+		"token_response_invalid":      true, "token_request_failed": true,
+		"token_exchange_failed": true,
+		// Emitted as literals at their own call sites.
+		"internal_error": true, "headless_shell": true,
+	},
+	"api_key": {
+		"internal_error": true, "api_key_aborted": true, "api_key_invalid_input": true,
+	},
+	"device": {
+		"internal_error": true, "unattended_environment": true,
+		"authorization_request_failed": true, "identity_verification_failed": true,
+		"credential_persistence_failed": true, "token_poll_failed": true,
+		"device_access_denied": true, "device_code_expired": true,
+		"device_invalid_client": true, "device_invalid_grant": true,
+		"device_oauth_error": true,
+	},
+	"device_code": {"device_code_unsupported": true},
+}
+
+// TestOAuthFailureReason_BoundedVocabulary pins only what the classifier
+// returns. Several reasons are emitted as bare literals at their own call
+// sites and would bypass it entirely, so scan the source too: a new literal
+// added without updating allowedLoginFailureReasons fails here.
+func TestAuthLoginFailedLiteralsAreInAllowedVocabulary(t *testing.T) {
+	src, err := os.ReadFile("auth_login.go")
+	if err != nil {
+		t.Fatalf("read auth_login.go: %v", err)
+	}
+	// Matches only literal/literal calls; the classifier-routed sites pass a
+	// function call and are covered by TestOAuthFailureReason and
+	// TestTokenFailureReason.
+	re := regexp.MustCompile(`AuthLoginFailed\("([a-z_]+)",\s*"([a-z_]+)"\)`)
+	matches := re.FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatal("no literal AuthLoginFailed call sites found — the scan would pass vacuously")
+	}
+	for _, m := range matches {
+		method, reason := m[1], m[2]
+		allowed, ok := allowedLoginFailureReasons[method]
+		if !ok {
+			t.Errorf("AuthLoginFailed uses unknown method %q; add it to allowedLoginFailureReasons", method)
+			continue
+		}
+		if !allowed[reason] {
+			t.Errorf("AuthLoginFailed(%q, %q) is not in the allowed vocabulary; these are analytics "+
+				"dimensions, so add it deliberately to allowedLoginFailureReasons", method, reason)
+		}
+	}
+}
+
+// The classifier's outputs must also live in the shared allowed set, so the
+// two pins cannot drift apart.
+func TestOAuthFailureReasonOutputsAreInAllowedVocabulary(t *testing.T) {
+	for _, err := range []error{
+		oauth.ErrLoopbackTimeout, oauth.ErrLoopbackCanceled,
+		oauth.ErrAuthorizeDenied, oauth.ErrAuthorizeFailed,
+		oauth.ErrStateMismatch, oauth.ErrMissingCode,
+		oauth.ErrLoopbackServer, errors.New("unmapped"),
+	} {
+		if got := oauthFailureReason(err); !allowedLoginFailureReasons["oauth"][got] {
+			t.Errorf("oauthFailureReason(%v) = %q, outside the allowed oauth vocabulary", err, got)
+		}
+	}
+}
+
+func TestDeviceFailureReasonOutputsAreInAllowedVocabulary(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"access denied", &oauth.DeviceAuthorizationError{Code: "access_denied"}, "device_access_denied"},
+		{"expired", &oauth.DeviceAuthorizationError{Code: "expired_token"}, "device_code_expired"},
+		{"invalid client", &oauth.DeviceAuthorizationError{Code: "invalid_client"}, "device_invalid_client"},
+		{"invalid grant", &oauth.DeviceAuthorizationError{Code: "invalid_grant"}, "device_invalid_grant"},
+		{"unknown server code", &oauth.DeviceAuthorizationError{Code: "attacker-controlled"}, "device_oauth_error"},
+		{"non-oauth error", errors.New("network down"), "token_poll_failed"},
+		{"wrapped code", fmt.Errorf("poll: %w", &oauth.DeviceAuthorizationError{Code: "access_denied"}), "device_access_denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deviceFailureReason(tt.err)
+			if got != tt.want {
+				t.Fatalf("deviceFailureReason(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+			if !allowedLoginFailureReasons["device"][got] {
+				t.Fatalf("deviceFailureReason(%v) = %q, outside the allowed device vocabulary", tt.err, got)
+			}
+		})
+	}
+}
+
+func TestTokenFailureReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"rejected code", oauth.ErrRejected, "token_rejected"},
+		{"canceled", oauth.ErrTokenCanceled, "token_canceled"},
+		{"network", oauth.ErrTokenNetwork, "token_network_error"},
+		{"5xx", oauth.ErrTokenServerError, "token_server_error"},
+		{"429", oauth.ErrTokenRateLimited, "token_rate_limited"},
+		{"client misconfigured", oauth.ErrTokenClientConfig, "token_client_error"},
+		{"rejection we inferred", fmt.Errorf("%w: %w", oauth.ErrRejected, oauth.ErrRejectionUnclassified), "token_rejected_unclassified"},
+		{"other non-2xx", oauth.ErrTokenUnexpectedStatus, "token_http_error"},
+		{"bad body", oauth.ErrTokenResponseInvalid, "token_response_invalid"},
+		{"build failure", oauth.ErrTokenRequestFailed, "token_request_failed"},
+		{"unmapped falls back", errors.New("something new"), "token_exchange_failed"},
+		{"wrapped still matches", fmt.Errorf("ctx: %w", oauth.ErrTokenNetwork), "token_network_error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tokenFailureReason(tt.err); got != tt.want {
+				t.Errorf("tokenFailureReason(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTokenFailureReasonOutputsAreInAllowedVocabulary(t *testing.T) {
+	for _, err := range []error{
+		oauth.ErrRejected, oauth.ErrTokenCanceled, oauth.ErrTokenNetwork,
+		oauth.ErrTokenServerError, oauth.ErrTokenUnexpectedStatus,
+		oauth.ErrTokenResponseInvalid, oauth.ErrTokenRequestFailed,
+		oauth.ErrTokenRateLimited, oauth.ErrTokenClientConfig,
+		fmt.Errorf("%w: %w", oauth.ErrRejected, oauth.ErrRejectionUnclassified),
+		errors.New("unmapped"),
+	} {
+		if got := tokenFailureReason(err); !allowedLoginFailureReasons["oauth"][got] {
+			t.Errorf("tokenFailureReason(%v) = %q, outside the allowed oauth vocabulary", err, got)
+		}
+	}
+}
+
+// A rejected code and a 5xx must not collapse into the same reason: one needs a
+// fresh login, the other is worth retrying. This is the whole point of the split.
+func TestTokenFailureReason_SeparatesRetryableFromTerminal(t *testing.T) {
+	terminal := tokenFailureReason(oauth.ErrRejected)
+	retryable := []string{
+		tokenFailureReason(oauth.ErrTokenNetwork),
+		tokenFailureReason(oauth.ErrTokenServerError),
+		tokenFailureReason(oauth.ErrTokenRateLimited),
+		tokenFailureReason(oauth.ErrTokenCanceled),
+	}
+	for _, r := range retryable {
+		if r == terminal {
+			t.Errorf("retryable reason %q collapses into the terminal reason %q", r, terminal)
+		}
+	}
+}

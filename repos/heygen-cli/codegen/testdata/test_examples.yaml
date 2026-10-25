@@ -1,0 +1,30 @@
+"GET /v3/videos":
+  - desc: "List videos"
+    cmd: "heygen video list --limit 10"
+"POST /v3/videos":
+  - desc: "Create a video"
+    cmd: "heygen video create --script 'Hello world' --avatar-id josh"
+"GET /v3/videos/{video_id}":
+  - desc: "Get a video"
+    cmd: "heygen video get <video-id>"
+"DELETE /v3/videos/{video_id}":
+  - desc: "Delete a video"
+    cmd: "heygen video delete <video-id>"
+"GET /v3/videos/{video_id}/caption":
+  - desc: "Download caption"
+    cmd: "heygen video caption get <video-id>"
+"POST /v3/assets":
+  - desc: "Upload an asset"
+    cmd: "heygen asset create --file ./video.mp4"
+"GET /v3/avatars":
+  - desc: "List avatars"
+    cmd: "heygen avatar list --ownership public"
+"GET /v3/avatars/{group_id}":
+  - desc: "Get avatar details"
+    cmd: "heygen avatar get <group-id>"
+"POST /v3/avatars/{group_id}/consent":
+  - desc: "Submit avatar consent"
+    cmd: "heygen avatar consent create <group-id>"
+"GET /v3/user/me":
+  - desc: "View account info"
+    cmd: "heygen user me get"

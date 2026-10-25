@@ -1,0 +1,28 @@
+:root {
+  /* Abyss Tattoo Studio v3 — Official Palette */
+  --abyss-black: #050505;
+  --charcoal: #161616;
+  --bone: #E8E4DD;
+  --bone-muted: rgba(232, 228, 221, 0.68);
+  --bone-faint: rgba(232, 228, 221, 0.38);
+  --dark-gold: #8A642B;
+  --primary-gold: #C49A50;
+  --studio-green: #596047;
+
+  /* Aged, slightly burnished gold treatments (never bright yellow or casino) */
+  --gold-gradient-burnished: linear-gradient(135deg, #5e4219 0%, #8A642B 35%, #C49A50 68%, #735120 100%);
+  --gold-gradient-vertical: linear-gradient(180deg, rgba(138, 100, 43, 0) 0%, #8A642B 22%, #C49A50 50%, #8A642B 78%, rgba(138, 100, 43, 0) 100%);
+  --gold-hairline: rgba(196, 154, 80, 0.28);
+  --gold-hairline-strong: rgba(196, 154, 80, 0.58);
+  --gold-glow-controlled: rgba(138, 100, 43, 0.24);
+
+  /* Typography */
+  --font-display: 'Cinzel', Georgia, serif;
+  --font-editorial: 'Cormorant Garamond', Georgia, serif;
+  --font-sans: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
+
+  /* Motion & 2.5D Rig */
+  --ease-editorial: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-ritual: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-shutter: cubic-bezier(0.65, 0, 0.35, 1);
+}

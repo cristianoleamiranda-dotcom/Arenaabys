@@ -1,0 +1,596 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/heygen-com/heygen-cli/internal/command"
+	clierrors "github.com/heygen-com/heygen-cli/internal/errors"
+)
+
+const (
+	// APIDataField is the response envelope field containing the payload.
+	// Exported so the builder can pass it to the formatter for --human rendering.
+	APIDataField = "data"
+)
+
+// PollOptions controls ExecuteAndPoll behavior.
+type PollOptions struct {
+	Timeout   time.Duration
+	BaseDelay time.Duration
+	MaxDelay  time.Duration
+	OnStatus  func(status string, elapsed time.Duration)
+}
+
+// ErrPollFailed is returned when polling reaches a terminal failure state.
+// It carries the full status response so callers can output it (the response
+// often contains error details the user needs to diagnose the failure).
+type ErrPollFailed struct {
+	Data   json.RawMessage
+	Status string
+}
+
+func (e *ErrPollFailed) Error() string {
+	return fmt.Sprintf("operation reached terminal failure state: %s", e.Status)
+}
+
+// ErrPollTimeout is returned when polling times out after the resource has
+// been created but before a terminal status is reached.
+type ErrPollTimeout struct {
+	Data       json.RawMessage
+	ResourceID string
+}
+
+func (e *ErrPollTimeout) Error() string {
+	return fmt.Sprintf("polling timed out (resource %s still in progress)", e.ResourceID)
+}
+
+// ExecuteAndPoll executes a create request, then polls a status endpoint until
+// the resource reaches a terminal state or the context is canceled.
+func (c *Client) ExecuteAndPoll(
+	ctx context.Context,
+	spec *command.Spec,
+	inv *command.Invocation,
+	opts PollOptions,
+) (json.RawMessage, error) {
+	if spec.PollConfig == nil {
+		return nil, clierrors.New("spec is not configured for polling")
+	}
+
+	opts = defaultPollOptions(opts)
+	pollCtx, cancel := ensurePollContext(ctx, opts.Timeout)
+	defer cancel()
+
+	createResp, err := c.executeWithContext(pollCtx, spec, inv)
+	if err != nil {
+		return nil, translateCreateContextError(pollCtx, err, hasIdempotencyKey(inv))
+	}
+
+	resourceID, err := extractJSONPath(createResp, spec.PollConfig.IDField)
+	if err != nil {
+		return nil, &clierrors.CLIError{
+			Code: "cli_response_parse_error",
+			Message: fmt.Sprintf(
+				"failed to extract resource ID from %q: %v", spec.PollConfig.IDField, err),
+			Hint:     "The create response did not have the expected shape. This command may require manual polling for batch responses.",
+			ExitCode: clierrors.ExitGeneral,
+		}
+	}
+
+	// If IDField uses an array index (e.g., "data.ids.0"), reject batch
+	// responses with multiple IDs. --wait only supports single-resource polling.
+	if arrayLen, ok := extractArrayLen(createResp, spec.PollConfig.IDField); ok && arrayLen > 1 {
+		return nil, &clierrors.CLIError{
+			Code:     "batch_not_supported",
+			Message:  fmt.Sprintf("--wait does not support batch operations (got %d resources)", arrayLen),
+			Hint:     "Poll each resource individually with the corresponding get command",
+			ExitCode: clierrors.ExitGeneral,
+		}
+	}
+
+	pathParams, err := statusPathParams(spec.PollConfig.StatusEndpoint, resourceID)
+	if err != nil {
+		return nil, err
+	}
+
+	statusSpec := buildStatusSpec(spec.PollConfig.StatusEndpoint)
+	statusInv := &command.Invocation{
+		PathParams:  pathParams,
+		QueryParams: make(url.Values),
+	}
+	pollBackoff := RetryConfig{
+		BaseDelay: opts.BaseDelay,
+		MaxDelay:  opts.MaxDelay,
+	}
+	start := time.Now()
+	var lastStatusResp json.RawMessage
+
+	for attempt := 0; ; attempt++ {
+		if err := pollCtx.Err(); err != nil {
+			return nil, classifyPollContextError(err, resourceID, lastStatusResp)
+		}
+
+		statusResp, err := c.executeWithContext(pollCtx, statusSpec, statusInv)
+		if err != nil {
+			if ctxErr := pollCtx.Err(); ctxErr != nil {
+				return nil, classifyPollContextError(ctxErr, resourceID, lastStatusResp)
+			}
+			return nil, err
+		}
+		lastStatusResp = statusResp
+
+		status, err := extractJSONPath(statusResp, spec.PollConfig.StatusField)
+		if err != nil {
+			return nil, &clierrors.CLIError{
+				Code: "cli_response_parse_error",
+				Message: fmt.Sprintf(
+					"failed to extract status from %q: %v", spec.PollConfig.StatusField, err),
+				Hint:     "The status response did not have the expected shape. Retry; if it persists, report it.",
+				ExitCode: clierrors.ExitGeneral,
+			}
+		}
+
+		if slices.Contains(spec.PollConfig.TerminalOK, status) {
+			return statusResp, nil
+		}
+		if slices.Contains(spec.PollConfig.TerminalFail, status) {
+			return nil, &ErrPollFailed{Data: statusResp, Status: status}
+		}
+		if opts.OnStatus != nil {
+			opts.OnStatus(status, time.Since(start))
+		}
+
+		delay := backoffDelay(attempt, pollBackoff)
+		if err := waitForRetry(pollCtx, delay); err != nil {
+			if ctxErr := pollCtx.Err(); ctxErr != nil {
+				return nil, classifyPollContextError(ctxErr, resourceID, lastStatusResp)
+			}
+			return nil, err
+		}
+	}
+}
+
+// Execute sends an HTTP request described by the Spec (static metadata)
+// and Invocation (resolved user values). Returns the raw JSON response.
+//
+// The Spec provides the endpoint template, HTTP method, body encoding,
+// and behavioral flags (pagination, polling). The Invocation provides
+// the concrete path params, query params, body, and file path.
+func (c *Client) Execute(spec *command.Spec, inv *command.Invocation) (json.RawMessage, error) {
+	return c.executeWithContext(context.Background(), spec, inv)
+}
+
+// idempotencyKeyHeader is the spec-declared header behind --idempotency-key.
+// Header flags are generic, but timeout guidance is not: whether a write can be
+// safely re-sent depends on this header specifically.
+const idempotencyKeyHeader = "Idempotency-Key"
+
+// hasIdempotencyKey reports whether the invocation sends a usable key. An empty
+// value still occupies the map and still goes on the wire, where the API rejects
+// it, so presence alone must not be read as "this write is safe to re-send".
+func hasIdempotencyKey(inv *command.Invocation) bool {
+	return inv != nil && inv.Headers[idempotencyKeyHeader] != ""
+}
+
+func (c *Client) executeWithContext(ctx context.Context, spec *command.Spec, inv *command.Invocation) (json.RawMessage, error) {
+	if spec.Method == "" {
+		return nil, clierrors.New("Spec.Method must be set")
+	}
+
+	// Build URL from endpoint template + path params + query params
+	reqURL, err := buildURL(c.baseURL, spec.Endpoint, inv.PathParams, inv.QueryParams)
+	if err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to build request URL: %v", err))
+	}
+
+	// Build request based on body encoding
+	var req *http.Request
+	switch spec.BodyEncoding {
+	case "multipart":
+		req, err = buildMultipartRequest(spec.Method, reqURL, inv.FilePath)
+	default:
+		req, err = buildJSONRequest(spec.Method, reqURL, inv.Body)
+	}
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+
+	// Spec-declared headers (Idempotency-Key today). Set before Do, whose
+	// applyHeaders writes the reserved auth and attribution headers afterwards
+	// and so still wins: a spec header can never displace credentials.
+	for k, v := range inv.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		if errors.Is(err, ErrReLoginNeeded) {
+			return nil, &clierrors.CLIError{
+				Code:     "auth_error",
+				Message:  "OAuth session expired or rejected",
+				Hint:     "Run: heygen auth login",
+				ExitCode: clierrors.ExitAuth,
+			}
+		}
+		// A transport-level timeout (the per-request HTTP deadline elapsed
+		// before the response arrived) is classified as timeout/exit 4 — the
+		// same code on both the plain and --wait paths, so a slow create or
+		// upload no longer masquerades as a generic network_error on one path
+		// and a timeout on the other. net.Error.Timeout() is the robust
+		// detector: http.Client.Timeout's wrapped error does not reliably
+		// satisfy errors.Is(context.DeadlineExceeded), which is why the old
+		// --wait path resorted to string-matching the error message.
+		var netErr net.Error
+		if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+			// A GET is safe to retry. A non-GET (create/write) may have been
+			// committed server-side before the client deadline elapsed, so a
+			// blind retry can produce a duplicate (e.g. a second video create +
+			// charge). A caller-supplied idempotency key removes that risk,
+			// since the server replays the original response; without one the
+			// only safe move is to reconcile first, mirroring the poll-deadline
+			// guidance in newCreateContextError. Include the applied budget so
+			// support can see which per-operation timeout tripped.
+			hint := "The request took too long and timed out. Retry — a slow endpoint or a stalled network connection can cause this."
+			if spec.Method != http.MethodGet {
+				hint = "The request timed out, but the operation may have been submitted. Check with the corresponding get/list command before retrying, to avoid creating a duplicate."
+				if hasIdempotencyKey(inv) {
+					hint = "The request timed out, but the operation may have been submitted. Re-run the same command with the same --idempotency-key value: the server replays the original result instead of creating a duplicate."
+				}
+			}
+			msg := "request timed out"
+			if c.httpClient.Timeout > 0 {
+				msg = fmt.Sprintf("request timed out after %s", c.httpClient.Timeout)
+			}
+			return nil, &clierrors.CLIError{
+				Code:     "timeout",
+				Message:  fmt.Sprintf("%s: %v", msg, err),
+				Hint:     hint,
+				ExitCode: clierrors.ExitTimeout,
+			}
+		}
+		// network_error is a grandfathered bare code (not cli_-prefixed): it is
+		// shared with the download-command transport path (cmd/heygen/video_download.go)
+		// and predates the cli_ convention. See the grandfathered set in
+		// internal/errors/codes.go; keep both emission sites bare and in sync.
+		return nil, &clierrors.CLIError{
+			Code:     "network_error",
+			Message:  fmt.Sprintf("request failed: %v", err),
+			Hint:     "This is usually a temporary network issue. If it persists, check your connection",
+			ExitCode: clierrors.ExitGeneral,
+		}
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// Mid-response read failure is a dropped connection, not a parse issue.
+		// The response arrived (status known) before the body dropped, so record
+		// it: dashboards can then tell this from the pre-response transport failure
+		// above (where resp is nil and the status is genuinely 0).
+		return nil, &clierrors.CLIError{
+			Code:       "network_error",
+			Message:    fmt.Sprintf("failed to read response body: %v", err),
+			Hint:       "This is usually a temporary network issue. Check your connection and retry.",
+			HTTPStatus: resp.StatusCode,
+			ExitCode:   clierrors.ExitGeneral,
+		}
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, parseErrorResponse(resp.StatusCode, respBody, resp.Header.Get("X-Request-Id"))
+	}
+
+	return json.RawMessage(respBody), nil
+}
+
+// buildURL constructs the full URL with path param substitution and query params.
+func buildURL(base, endpoint string, pathParams map[string]string, queryParams url.Values) (string, error) {
+	path := endpoint
+	for key, val := range pathParams {
+		path = strings.ReplaceAll(path, "{"+key+"}", url.PathEscape(val))
+	}
+
+	u, err := url.Parse(base + path)
+	if err != nil {
+		return "", err
+	}
+
+	if len(queryParams) > 0 {
+		q := u.Query()
+		for key, vals := range queryParams {
+			for _, v := range vals {
+				q.Add(key, v)
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+
+	return u.String(), nil
+}
+
+// buildJSONRequest creates an HTTP request with an optional JSON body.
+// If body is nil, no request body is sent (used by GET, DELETE, and bodyless POST endpoints).
+func buildJSONRequest(method, reqURL string, body map[string]any) (*http.Request, error) {
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, clierrors.New(fmt.Sprintf("failed to marshal request body: %v", err))
+		}
+		reader = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequest(method, reqURL, reader)
+	if err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to create request: %v", err))
+	}
+	return req, nil
+}
+
+// buildMultipartRequest creates an HTTP request with a multipart/form-data body
+// containing the file at the given path. The file is sent under the field name "file".
+func buildMultipartRequest(method, reqURL, filePath string) (*http.Request, error) {
+	if filePath == "" {
+		return nil, clierrors.New("file path is required for multipart upload")
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to open file %q: %v", filePath, err))
+	}
+	defer file.Close()
+
+	var requestBody bytes.Buffer
+	multipartWriter := multipart.NewWriter(&requestBody)
+
+	filePart, err := multipartWriter.CreateFormFile("file", filepath.Base(filePath))
+	if err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to create form file: %v", err))
+	}
+
+	if _, err := io.Copy(filePart, file); err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to write file to form: %v", err))
+	}
+
+	if err := multipartWriter.Close(); err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to close multipart writer: %v", err))
+	}
+
+	req, err := http.NewRequest(method, reqURL, &requestBody)
+	if err != nil {
+		return nil, clierrors.New(fmt.Sprintf("failed to create request: %v", err))
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+
+	return req, nil
+}
+
+func defaultPollOptions(opts PollOptions) PollOptions {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 10 * time.Minute
+	}
+	if opts.BaseDelay <= 0 {
+		opts.BaseDelay = 2 * time.Second
+	}
+	if opts.MaxDelay <= 0 {
+		opts.MaxDelay = 30 * time.Second
+	}
+	return opts
+}
+
+func ensurePollContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok || timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func buildStatusSpec(endpoint string) *command.Spec {
+	return &command.Spec{
+		Endpoint: endpoint,
+		Method:   http.MethodGet,
+	}
+}
+
+func statusPathParams(endpoint, resourceID string) (map[string]string, error) {
+	params := make(map[string]string)
+	start := strings.Index(endpoint, "{")
+	end := strings.Index(endpoint, "}")
+	if start == -1 || end == -1 || end <= start+1 {
+		return nil, clierrors.New(fmt.Sprintf("status endpoint %q must contain exactly one path parameter", endpoint))
+	}
+	if strings.Contains(endpoint[end+1:], "{") {
+		return nil, clierrors.New(fmt.Sprintf("status endpoint %q must contain exactly one path parameter", endpoint))
+	}
+	params[endpoint[start+1:end]] = resourceID
+	return params, nil
+}
+
+// extractArrayLen checks if a dot-notation path ends with a numeric index
+// (e.g., "data.ids.0"), and if so, returns the length of that array.
+// Returns (0, false) if the path doesn't end with an array index.
+func extractArrayLen(raw json.RawMessage, path string) (int, bool) {
+	parts := strings.Split(path, ".")
+	if len(parts) < 2 {
+		return 0, false
+	}
+	// Check if the last segment is a numeric index
+	if _, err := strconv.Atoi(parts[len(parts)-1]); err != nil {
+		return 0, false
+	}
+	// Walk to the parent array
+	arrayPath := strings.Join(parts[:len(parts)-1], ".")
+
+	var current any
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return 0, false
+	}
+	for _, part := range strings.Split(arrayPath, ".") {
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return 0, false
+		}
+		next, ok := obj[part]
+		if !ok {
+			return 0, false
+		}
+		current = next
+	}
+	arr, ok := current.([]any)
+	if !ok {
+		return 0, false
+	}
+	return len(arr), true
+}
+
+// extractJSONPath extracts a string value from JSON using dot-notation.
+// Supports object fields ("data.status") and array indices ("data.ids.0").
+func extractJSONPath(raw json.RawMessage, path string) (string, error) {
+	if path == "" {
+		return "", clierrors.New("JSON path is required")
+	}
+
+	var current any
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return "", &clierrors.CLIError{
+			Code:     "cli_response_parse_error",
+			Message:  fmt.Sprintf("failed to parse JSON response: %v", err),
+			Hint:     "The API response could not be parsed. Retry; if it persists, report it (possible CLI/API mismatch).",
+			ExitCode: clierrors.ExitGeneral,
+		}
+	}
+
+	for _, part := range strings.Split(path, ".") {
+		// Try numeric index for arrays
+		if idx, err := strconv.Atoi(part); err == nil {
+			arr, ok := current.([]any)
+			if !ok {
+				return "", clierrors.New(fmt.Sprintf("field at %q is not an array", part))
+			}
+			if idx < 0 || idx >= len(arr) {
+				return "", clierrors.New(fmt.Sprintf("array index %d out of bounds (length %d)", idx, len(arr)))
+			}
+			current = arr[idx]
+			continue
+		}
+
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return "", clierrors.New(fmt.Sprintf("field %q is not an object", part))
+		}
+
+		next, ok := obj[part]
+		if !ok {
+			return "", clierrors.New(fmt.Sprintf("field %q not found", part))
+		}
+		current = next
+	}
+
+	value, ok := current.(string)
+	if !ok || value == "" {
+		return "", clierrors.New(fmt.Sprintf("field %q is not a string", path))
+	}
+	return value, nil
+}
+
+// translateCreateContextError maps a canceled/expired poll context to a
+// user-friendly CLIError when the create request fails before a resource ID is
+// known. A tripped poll deadline returns exit 4 (timeout, the operation may
+// exist server-side); an explicit cancel returns exit 1. A transport-level
+// request timeout that fires while the poll context is still live is already
+// classified as timeout/exit 4 by executeWithContext, so it passes through the
+// final return unchanged — no message string-matching required.
+func translateCreateContextError(ctx context.Context, err error, keyed bool) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return newCreateContextError(ctxErr, keyed)
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return newCreateContextError(err, keyed)
+	}
+	return err
+}
+
+// keyed carries whether the create sent a usable idempotency key. This path runs
+// before any resource ID is known, so the default advice is to reconcile by
+// hand; with a key, re-running the same command is both simpler and safe.
+func newCreateContextError(err error, keyed bool) error {
+	hint := "Re-run the corresponding get command to check the current status manually"
+	if keyed {
+		hint = "Re-run the same command with the same --idempotency-key value: the server replays the original result instead of creating a duplicate"
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return &clierrors.CLIError{
+			Code:     "timeout",
+			Message:  "polling timed out before the operation completed",
+			Hint:     hint,
+			ExitCode: clierrors.ExitTimeout,
+		}
+	case errors.Is(err, context.Canceled):
+		return &clierrors.CLIError{
+			Code:     "canceled",
+			Message:  "polling was canceled before the operation completed",
+			Hint:     hint,
+			ExitCode: clierrors.ExitGeneral,
+		}
+	default:
+		return clierrors.New(err.Error())
+	}
+}
+
+func classifyPollContextError(err error, resourceID string, lastResp json.RawMessage) error {
+	if err == nil {
+		return clierrors.New("unexpected nil context error during polling")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &ErrPollTimeout{
+			Data:       lastResp,
+			ResourceID: resourceID,
+		}
+	}
+	return &clierrors.CLIError{
+		Code:     "canceled",
+		Message:  "polling was canceled before the operation completed",
+		Hint:     "Re-run the corresponding get command to check the current status manually",
+		ExitCode: clierrors.ExitGeneral,
+	}
+}
+
+// parseErrorResponse parses an API error response into a CLIError.
+//
+// A body that unmarshals into the v3 envelope with a code OR message is a real app
+// error (the code-or-message gate is relaxed from the old message-only check so a
+// code-only envelope keeps its code instead of collapsing to generic "error"). Any
+// other body — gateway/WAF HTML, an empty body, or a foreign JSON shape — did not
+// come from the v3 app; it is classified by HTTP status via FromAPIError (which maps
+// 4xx to client codes, 5xx to unclassified_server_error, unmapped to
+// unclassified_client_error, and synthesizes a non-empty message).
+func parseErrorResponse(statusCode int, body []byte, requestID string) *clierrors.CLIError {
+	var envelope struct {
+		Error clierrors.APIError `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil &&
+		(envelope.Error.Code != "" || envelope.Error.Message != "") {
+		return clierrors.FromAPIError(statusCode, &envelope.Error, requestID)
+	}
+
+	return clierrors.FromAPIError(statusCode, &clierrors.APIError{}, requestID)
+}

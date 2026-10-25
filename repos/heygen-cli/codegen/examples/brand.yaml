@@ -1,0 +1,50 @@
+"GET /v3/brand-kits":
+  - desc: "List brand kits"
+    cmd: "heygen brand kits list"
+"POST /v3/brand-kits":
+  - desc: "Build a brand kit from a public website, importing its logos, colors and fonts"
+    cmd: "heygen brand kits create --url https://www.heygen.com"
+  - desc: "Name the kit yourself instead of taking the brand name detected on the site"
+    cmd: "heygen brand kits create --url https://www.heygen.com --name 'HeyGen brand'"
+"GET /v3/brand-kits/{brand_kit_id}":
+  - desc: "Inspect a kit's colors, logos and fonts. Create returns while the import is still running, so poll this until status is no longer 'loading'"
+    cmd: "heygen brand kits get <brand-kit-id>"
+"PATCH /v3/brand-kits/{brand_kit_id}":
+  - desc: "Rename a kit, leaving its role assignments untouched"
+    cmd: "heygen brand kits update <brand-kit-id> --name 'HeyGen brand'"
+  - desc: "Assign color roles (no flags for these, pass them via -d). Each role object is a full replace, so send every role you want to keep"
+    cmd: "heygen brand kits update <brand-kit-id> -d '{\"color_roles\":{\"primary\":\"#FF5733\",\"accent\":\"#1B998B\"}}'"
+  - desc: "Clear every color role, leaving the kit's colors themselves in place"
+    cmd: "heygen brand kits update <brand-kit-id> -d '{\"color_roles\":{}}'"
+  - desc: "See all available request fields"
+    cmd: "heygen brand kits update --request-schema"
+"DELETE /v3/brand-kits/{brand_kit_id}":
+  - desc: "Delete a brand kit and the colors, logos and fonts it holds"
+    cmd: "heygen brand kits delete <brand-kit-id>"
+"GET /v3/brand-glossaries":
+  - desc: "List brand glossaries"
+    cmd: "heygen brand glossaries list"
+"POST /v3/brand-glossaries":
+  - desc: "Create a glossary with pronunciations (terms has no flag — pass it via -d)"
+    cmd: "heygen brand glossaries create -d '{\"name\":\"Product names\",\"terms\":[{\"term\":\"HeyGen\",\"pronunciation\":\"hey-jen\"}]}'"
+  - desc: "Create an empty glossary to fill in later"
+    cmd: "heygen brand glossaries create --name 'Product names'"
+  - desc: "See all available request fields"
+    cmd: "heygen brand glossaries create --request-schema"
+"GET /v3/brand-glossaries/{brand_glossary_id}":
+  - desc: "Inspect a glossary's term mappings"
+    cmd: "heygen brand glossaries get <brand-glossary-id>"
+"PATCH /v3/brand-glossaries/{brand_glossary_id}":
+  - desc: "Replace the term list — terms is a full replace, so send every term you want to keep"
+    cmd: "heygen brand glossaries update <brand-glossary-id> -d '{\"terms\":[{\"term\":\"HeyGen\",\"pronunciation\":\"hey-jen\"},{\"term\":\"Avatar IV\",\"pronunciation\":\"avatar four\"}]}'"
+  - desc: "Rename a glossary, leaving its terms untouched"
+    cmd: "heygen brand glossaries update <brand-glossary-id> --name 'Product names'"
+  - desc: "Remove every term but keep the glossary"
+    cmd: "heygen brand glossaries update <brand-glossary-id> -d '{\"terms\":[]}'"
+  - desc: "See all available request fields"
+    cmd: "heygen brand glossaries update --request-schema"
+"DELETE /v3/brand-glossaries/{brand_glossary_id}":
+  - desc: "Delete a brand glossary, confirming at an interactive prompt. Cannot be undone: the glossary stops applying immediately, though videos already generated with it keep the audio they were synthesized with"
+    cmd: "heygen brand glossaries delete <brand-glossary-id>"
+  - desc: "Skip the prompt. Required when stdin is not a terminal, so this is the form a script or agent needs"
+    cmd: "heygen brand glossaries delete <brand-glossary-id> --force"

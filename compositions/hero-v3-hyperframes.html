@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=1920, height=1080" />
+  <title>Abyss Tattoo Studio v3 — HyperFrames Deterministic Hero 3D Composition</title>
+  <style>
+    @font-face {
+      font-family: 'Cinzel';
+      src: url('../assets/fonts/cinzel.woff2') format('woff2');
+      font-weight: 400 800;
+    }
+    @font-face {
+      font-family: 'Montserrat';
+      src: url('../assets/fonts/montserrat.woff2') format('woff2');
+      font-weight: 300 800;
+    }
+
+    :root {
+      --abyss-black: #050505;
+      --charcoal: #161616;
+      --bone: #E8E4DD;
+      --dark-gold: #8A642B;
+      --primary-gold: #C49A50;
+      --studio-green: #596047;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    #root {
+      position: relative;
+      width: 1920px;
+      height: 1080px;
+      background-color: var(--abyss-black);
+      color: var(--bone);
+      font-family: 'Montserrat', sans-serif;
+      overflow: hidden;
+      perspective: 1400px;
+    }
+
+    .clip {
+      position: absolute;
+      inset: 0;
+    }
+
+    .stage-3d {
+      position: absolute;
+      inset: 0;
+      transform-style: preserve-3d;
+    }
+
+    .layer {
+      position: absolute;
+      inset: 0;
+      transform-style: preserve-3d;
+    }
+
+    .studio-frame {
+      position: absolute;
+      width: 1380px;
+      height: 880px;
+      left: 270px;
+      top: 100px;
+      border: 1px solid rgba(89, 96, 71, 0.28);
+      background: var(--charcoal);
+      overflow: hidden;
+    }
+
+    .studio-frame img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0.85;
+    }
+
+    .subject-monolith {
+      position: absolute;
+      width: 680px;
+      height: 860px;
+      left: 880px;
+      top: 110px;
+      background: var(--abyss-black);
+      border: 1px solid rgba(196, 154, 80, 0.30);
+      overflow: hidden;
+      box-shadow: 0 36px 90px rgba(0, 0, 0, 0.95);
+    }
+
+    .subject-monolith img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center 42%;
+    }
+
+    .fg-plane {
+      position: absolute;
+      width: 680px;
+      height: 860px;
+      left: 880px;
+      top: 110px;
+      pointer-events: none;
+    }
+
+    .fg-plane img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center 42%;
+    }
+
+    .vertical-gold-line {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 1220px;
+      width: 2px;
+      background: linear-gradient(180deg, transparent 0%, #8A642B 20%, #C49A50 50%, #8A642B 80%, transparent 100%);
+      transform: scaleY(0);
+      transform-origin: top center;
+    }
+
+    .typo-block {
+      position: absolute;
+      left: 160px;
+      top: 290px;
+    }
+
+    .descriptor {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.42em;
+      color: var(--primary-gold);
+      margin-bottom: 14px;
+    }
+
+    .brand-3d {
+      font-family: 'Cinzel', serif;
+      font-size: 196px;
+      font-weight: 700;
+      line-height: 0.88;
+      letter-spacing: 0.14em;
+      color: var(--bone);
+      text-shadow:
+        -1px -1px 0 rgba(196, 154, 80, 0.38),
+        2px 2px 0 #1b1712,
+        4px 4px 0 #120f0b,
+        0 26px 60px rgba(0, 0, 0, 0.95);
+    }
+
+    .services-pill {
+      position: absolute;
+      left: 160px;
+      top: 640px;
+      padding: 10px 20px;
+      background: rgba(22, 22, 22, 0.88);
+      border-left: 3px solid var(--primary-gold);
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 0.32em;
+      color: var(--bone);
+    }
+
+    .manifesto-row {
+      position: absolute;
+      left: 160px;
+      top: 715px;
+      display: flex;
+      gap: 24px;
+      font-family: 'Cinzel', serif;
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: 0.10em;
+    }
+
+    .cta-box {
+      position: absolute;
+      left: 160px;
+      top: 805px;
+      padding: 20px 38px;
+      background: #161616;
+      border: 1px solid var(--primary-gold);
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.24em;
+      color: var(--bone);
+    }
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="abyss-hero-v3" data-duration="8.0" data-fps="30" data-width="1920" data-height="1080">
+    <div class="clip" id="hero-scene" data-start="0" data-duration="8.0" data-track-index="0" data-track-kind="graphics">
+      <div class="stage-3d" id="stage-3d">
+        <div class="layer" id="l01-bg">
+          <img src="../assets/hero_v3/p01_ritual_bg.webp" alt="" style="width:100%;height:100%;object-fit:cover;opacity:0.75;" />
+        </div>
+        <div class="layer" id="l02-studio">
+          <div class="studio-frame" id="studio-frame">
+            <img src="../assets/hero_v3/p01_ritual_studio.webp" alt="" />
+          </div>
+        </div>
+        <div class="layer" id="l04-subject">
+          <div class="subject-monolith" id="subject-monolith">
+            <img src="../assets/hero_v3/p01_ritual_subject.webp" alt="" />
+          </div>
+        </div>
+        <div class="layer" id="l05-fg">
+          <div class="fg-plane" id="fg-plane">
+            <img src="../assets/hero_v3/p01_ritual_foreground.webp" alt="" />
+          </div>
+        </div>
+        <div class="layer" id="l06-typo">
+          <div class="typo-block" id="typo-block">
+            <div class="descriptor" id="desc-el">TATTOO STUDIO</div>
+            <div class="brand-3d" id="brand-el">ABYSS</div>
+          </div>
+        </div>
+        <div class="layer" id="l07-gold">
+          <div class="vertical-gold-line" id="gold-line"></div>
+        </div>
+        <div class="layer" id="l09-ui">
+          <div class="services-pill" id="services-el">TATTOO • PIERCING • ART</div>
+          <div class="manifesto-row" id="manifesto-el">
+            <span>TU CUERPO.</span>
+            <span style="color:rgba(232,228,221,0.8)">TU HISTORIA.</span>
+            <span style="color:#C49A50">TU RITUAL.</span>
+          </div>
+          <div class="cta-box" id="cta-el">RESERVA TU SESIÓN →</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

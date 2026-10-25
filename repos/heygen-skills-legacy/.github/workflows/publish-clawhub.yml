@@ -1,0 +1,114 @@
+name: Publish to ClawHub
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'skills/**'
+  workflow_dispatch:  # Manual trigger option
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ClawHub CLI
+        run: npm install -g clawhub
+
+      - name: Login to ClawHub
+        run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
+
+      - name: Publish create-video skill
+        run: |
+          clawhub publish ./skills/create-video \
+            --slug create-video \
+            --name "Create Video" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,heygen,text-to-video,video-generation,ai-video,video-agent,prompt-to-video \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish avatar-video skill
+        run: |
+          clawhub publish ./skills/avatar-video \
+            --slug avatar-video \
+            --name "Avatar Video" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,heygen,ai-avatar,talking-head,avatar,digital-human,multi-scene \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish heygen skill (deprecated)
+        run: |
+          clawhub publish ./skills/heygen \
+            --slug video-agent \
+            --name "Video Agent (Deprecated)" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,heygen,deprecated \
+            --changelog "Deprecated — use create-video or avatar-video instead"
+
+      - name: Publish text-to-speech skill
+        run: |
+          clawhub publish ./skills/text-to-speech \
+            --slug text-to-speech-heygen \
+            --name "Text to Speech" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,tts,text-to-speech,heygen,audio,voice,speech,starfish \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish video-translate skill
+        run: |
+          clawhub publish ./skills/video-translate \
+            --slug video-translate \
+            --name "Video Translate" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,translation,dubbing,heygen,video-translate,localization,lip-sync \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish video-download skill
+        run: |
+          clawhub publish ./skills/video-download \
+            --slug video-download \
+            --name "Video Download" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,yt-dlp,download,youtube,audio,local \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish ai-video-gen skill
+        run: |
+          clawhub publish ./skills/ai-video-gen \
+            --slug ai-video-gen-heygen \
+            --name "AI Video Gen" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,heygen,ai,generation,text-to-video,veo,kling,sora,runway,workflow-gateway \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish video-edit skill
+        run: |
+          clawhub publish ./skills/video-edit \
+            --slug video-edit \
+            --name "Video Edit" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,ffmpeg,editing,trim,resize,compress,convert,local \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish video-understand skill
+        run: |
+          clawhub publish ./skills/video-understand \
+            --slug video-understand \
+            --name "Video Understand" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,video,ffmpeg,whisper,transcription,frame-extraction,local,offline \
+            --changelog "Auto-publish from commit ${{ github.sha }}"
+
+      - name: Publish faceswap skill
+        run: |
+          clawhub publish ./skills/faceswap \
+            --slug faceswap-heygen \
+            --name "Faceswap" \
+            --version 2.${{ github.run_number }}.0 \
+            --tags latest,faceswap,heygen,face,swap,video,gpu,workflow-gateway \
+            --changelog "Auto-publish from commit ${{ github.sha }}"

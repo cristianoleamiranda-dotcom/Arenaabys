@@ -1,0 +1,362 @@
+openapi: "3.0.0"
+info:
+  title: Test API
+  version: "3.0"
+paths:
+  /v3/videos:
+    get:
+      tags: [Videos]
+      summary: List videos
+      description: Returns a paginated list of videos.
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of items to return
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: token
+          in: query
+          description: Pagination token
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      videos:
+                        type: array
+                        items:
+                          type: object
+                      next_token:
+                        type: string
+    post:
+      tags: [Videos]
+      summary: Create a video
+      description: Creates a new video.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Key for safely retrying this mutation.
+          schema:
+            type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - script
+              properties:
+                script:
+                  type: string
+                  description: Video script text
+                title:
+                  anyOf:
+                    - type: string
+                    - type: "null"
+                  description: Optional video title
+                avatar-id:
+                  type: string
+                  description: Avatar to use
+                  enum: [josh, anna, lisa]
+                categories:
+                  anyOf:
+                    - type: array
+                      items:
+                        type: string
+                        enum: [marketing, social]
+                    - type: "null"
+                  description: Optional video categories
+                quality:
+                  type: integer
+                  description: Video quality (1-100)
+                  minimum: 1
+                  maximum: 100
+                fps:
+                  type: integer
+                  description: Frames per second
+                  default: 30
+                aspect_ratio:
+                  type: string
+                  description: Output aspect ratio
+                  enum: ["16:9", "9:16", auto]
+                  default: "16:9"
+                  x-cli-default: auto
+                legacy_caption:
+                  type: boolean
+                  description: Superseded field the API still accepts but ignores
+                  deprecated: true
+                watermark_s3_key:
+                  type: string
+                  description: Internal watermark asset key
+                  x-cli-visible: false
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  description: Tags for the video
+                settings:
+                  type: object
+                  description: Advanced rendering settings
+      responses:
+        "201":
+          description: Created
+
+  /v3/videos/{video_id}:
+    get:
+      tags: [Videos]
+      summary: Get video details
+      description: Returns a single video by ID.
+      parameters:
+        - name: video_id
+          in: path
+          required: true
+          description: The video ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+    delete:
+      tags: [Videos]
+      summary: Delete a video
+      description: Deletes a video by ID.
+      parameters:
+        - name: video_id
+          in: path
+          required: true
+          description: The video ID
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /v3/videos/{video_id}/caption:
+    get:
+      tags: [Videos]
+      summary: Get video caption
+      description: Returns caption file for a video.
+      parameters:
+        - name: video_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /v3/assets:
+    post:
+      tags: [Assets]
+      summary: Upload an asset
+      description: Uploads a file as an asset.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload
+      responses:
+        "201":
+          description: Created
+
+  # Tagged into the "asset" group but rooted elsewhere. The asset commands above
+  # must keep their names; only this one carries a sub-group.
+  /v3/uploads:
+    get:
+      tags: [Assets]
+      summary: List uploads
+      responses:
+        "200":
+          description: OK
+
+  # Same shape, but for a group whose primary root is pinned rather than derived
+  # by normalization ("Video Translate" vs /v3/video-translations).
+  /v3/video-translations:
+    post:
+      tags: [Video Translate]
+      summary: Create a video translation
+      responses:
+        "201":
+          description: Created
+
+  /v3/dubs:
+    get:
+      tags: [Video Translate]
+      summary: List dubs
+      responses:
+        "200":
+          description: OK
+
+  /v3/avatars:
+    get:
+      tags: [Avatars]
+      summary: List avatars
+      description: Returns avatars.
+      parameters:
+        - name: ownership
+          in: query
+          description: Filter by ownership
+          schema:
+            anyOf:
+              - type: string
+              - type: integer
+        - name: legacy_filter
+          in: query
+          description: Superseded query filter the API still accepts
+          deprecated: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+
+  /v3/avatars/{group_id}:
+    get:
+      tags: [Avatars]
+      summary: Get an avatar group
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /v3/avatars/{group_id}/consent:
+    post:
+      tags: [Avatars]
+      summary: Create avatar consent
+      description: Initiates a consent flow for an avatar.
+      x-cli-action: true
+      parameters:
+        - name: group_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reroute-url:
+                  type: string
+                  description: URL to redirect after consent
+      responses:
+        "200":
+          description: OK
+
+  /v3/user/me:
+    get:
+      tags: [User]
+      summary: Get current user info
+      description: Returns the authenticated user's profile.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+
+  # One tag spanning two resources: the path root, not the tag, is what tells
+  # brand kits and brand glossaries apart.
+  /v3/brand-kits:
+    get:
+      tags: [Brand]
+      summary: List brand kits
+      responses:
+        "200":
+          description: OK
+
+  /v3/brand-kits/{brand_kit_id}:
+    get:
+      tags: [Brand]
+      summary: Get a brand kit
+      parameters:
+        - name: brand_kit_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /v3/brand-glossaries:
+    get:
+      tags: [Brand]
+      summary: List brand glossaries
+      responses:
+        "200":
+          description: OK
+
+  /v3/brand-glossaries/{brand_glossary_id}:
+    get:
+      tags: [Brand]
+      summary: Get a brand glossary
+      parameters:
+        - name: brand_glossary_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /v1/legacy:
+    get:
+      tags: [Legacy]
+      summary: Legacy endpoint
+      description: Should be filtered out (x-cli-visible false).
+      x-cli-visible: false
+      responses:
+        "200":
+          description: OK
+
+  /v3/hidden:
+    get:
+      tags: [Hidden]
+      summary: Hidden endpoint
+      description: Should be filtered out (x-cli-visible false).
+      x-cli-visible: false
+      responses:
+        "200":
+          description: OK

@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Set git to use LF
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Single source of truth for the Go version: go.mod's `go` directive.
+      # setup-go exports GOTOOLCHAIN=local, so the installed toolchain cannot
+      # upgrade itself to satisfy go.mod — a literal pin here that drifts below
+      # that directive is a hard build failure, not a silent downgrade. Reading
+      # the directive means the two cannot disagree.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.11.4
+          # goinstall builds through the Go checksum database; the default binary
+          # mode downloads a release binary without verifying it.
+          install-mode: goinstall
+
+  pr-template:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate PR template
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python .github/scripts/check_pr_template.py
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION="8.28.0"
+          # sha256 of gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz, from the release's
+          # checksums.txt. Change it together with the version.
+          GITLEAKS_SHA256="a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+          cd /tmp
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+          rm -f gitleaks.tar.gz
+
+      - name: Run gitleaks
+        run: gitleaks detect --source . --redact=10 --verbose
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Run govulncheck
+        # Allowlist GO-2026-5932 ONLY: golang.org/x/crypto/openpgp is unmaintained
+        # ("Fixed in: N/A") and pulled in transitively by go-selfupdate for a PGP
+        # validator the CLI does not use — the updater verifies SHA256 checksums
+        # (ChecksumValidator), not PGP, so openpgp is never reached with untrusted
+        # input. Any OTHER advisory still fails this job. Removal tracked in API-566.
+        run: |
+          out=$(govulncheck ./... 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+          # govulncheck exits 3 when vulnerabilities are found; any other non-zero
+          # code is a tool/build failure and must not be swallowed by the allowlist.
+          if [ "$rc" -ne 3 ]; then
+            echo "::error::govulncheck failed to run (exit $rc)"
+            exit 1
+          fi
+          ids=$(printf '%s\n' "$out" | grep -oE 'GO-[0-9]{4}-[0-9]+' | sort -u)
+          others=$(printf '%s\n' "$ids" | grep -vx 'GO-2026-5932' || true)
+          if [ -z "$ids" ] || [ -n "$others" ]; then
+            echo "::error::Unallowlisted or unrecognized govulncheck result (ids: ${ids:-none})"
+            exit 1
+          fi
+          echo "Only the allowlisted advisory GO-2026-5932 is present; passing."
+
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install GoReleaser
+        run: .github/scripts/install-goreleaser.sh
+
+      - run: goreleaser check
+
+  # Reports what a PR does to the generated command surface. Advisory only: it
+  # never fails, because reading the result needs judgment CI cannot supply — a
+  # removal can be correct when the same PR adds a deprecated alias. Blocking
+  # would also deadlock the codegen sync bot, which cannot add that alias itself.
+  surface-report:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the report diffs against the base commit.
+          fetch-depth: 0
+
+      - name: Report command-surface changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+
+          # Only speak up when the generated surface could have moved.
+          if git diff --quiet "$BASE_SHA" HEAD -- gen/; then
+            echo "gen/ untouched; nothing to report."
+            exit 0
+          fi
+
+          marker="<!-- command-surface-report -->"
+
+          if ! scripts/release-surface.sh report "$BASE_SHA" HEAD > /tmp/surface-report.md 2>/tmp/surface-err.txt; then
+            # Say so in the comment rather than only in the log. A silent
+            # failure leaves the previous report sitting there looking current,
+            # and the check stays green either way.
+            {
+              echo "$marker"
+              echo "### Command surface: report failed to generate"
+              echo
+              echo "This check could not read the surface, so it is telling you nothing about this PR."
+              echo "Run \`scripts/release-surface.sh diff <base> HEAD\` locally before merging."
+              echo
+              echo '```'
+              tail -5 /tmp/surface-err.txt 2>/dev/null || true
+              echo '```'
+            } > /tmp/surface-report.md
+            echo "::warning::surface report failed to generate; posting a failure notice, not blocking the PR"
+          fi
+
+          cat /tmp/surface-report.md >> "$GITHUB_STEP_SUMMARY"
+
+          # Update this job's own previous comment rather than posting a new one
+          # on every push. Keyed on the marker the report emits, not on author or
+          # position, so interleaved comments cannot confuse it.
+          # --paginate because issue comments come back 30 per page by default,
+          # so on a busy PR the marker falls off page one and this would post a
+          # duplicate every push - the exact thing the marker exists to prevent.
+          # --jq runs once PER PAGE, so emit every match and take the last
+          # overall; a per-page `last` would concatenate ids into a broken URL.
+          existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(.body | contains(\"$marker\")) | .id" 2>/dev/null | tail -1 || true)
+
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+              -F body=@/tmp/surface-report.md >/dev/null \
+              && echo "updated comment $existing" \
+              || echo "::warning::could not update the surface comment (fork PR?); summary still written"
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -F body=@/tmp/surface-report.md >/dev/null \
+              && echo "posted surface comment" \
+              || echo "::warning::could not post the surface comment (fork PR?); summary still written"
+          fi

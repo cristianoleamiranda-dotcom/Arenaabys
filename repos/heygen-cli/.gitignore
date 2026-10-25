@@ -1,0 +1,10 @@
+bin/
+/heygen
+*.exe
+
+# IDE / editor config
+.idea/
+.vscode/
+
+# GoReleaser output
+dist/

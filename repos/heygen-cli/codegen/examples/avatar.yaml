@@ -1,0 +1,40 @@
+"GET /v3/avatars":
+  - desc: "List avatars"
+    cmd: "heygen avatar list --limit 10"
+"GET /v3/avatars/{group_id}":
+  - desc: "Get avatar details"
+    cmd: "heygen avatar get <group-id>"
+"POST /v3/avatars":
+  - desc: "See required fields for avatar creation"
+    cmd: "heygen avatar create --request-schema"
+"DELETE /v3/avatars/{group_id}":
+  - desc: "Delete an avatar group and all its looks"
+    cmd: "heygen avatar delete <group-id>"
+"PATCH /v3/avatars/{group_id}":
+  - desc: "Set the avatar's default voice for video generation"
+    cmd: "heygen avatar update <group-id> --default-voice-id <voice-id>"
+"POST /v3/avatars/{group_id}/consent":
+  - desc: "Submit avatar consent"
+    cmd: "heygen avatar consent create <group-id>"
+"GET /v3/avatars/looks":
+  - desc: "Browse avatar looks"
+    cmd: "heygen avatar looks list --limit 10"
+"POST /v3/avatars/looks":
+  - desc: "Apply a Look Pack to the avatar a reference look belongs to"
+    cmd: "heygen avatar looks create -d '{\"type\":\"look_pack\",\"reference_look_id\":\"<look-id>\",\"template_id\":\"<template-id>\"}'"
+  - desc: "See both generation methods and their required fields"
+    cmd: "heygen avatar looks create --request-schema"
+"GET /v3/avatars/looks/{look_id}":
+  - desc: "Get look details"
+    cmd: "heygen avatar looks get <look-id>"
+"PATCH /v3/avatars/looks/{look_id}":
+  - desc: "Rename a look"
+    cmd: "heygen avatar looks update <look-id> --name 'New name'"
+"DELETE /v3/avatars/looks/{look_id}":
+  - desc: "Delete an avatar look"
+    cmd: "heygen avatar looks delete <look-id>"
+"GET /v3/avatars/look-templates":
+  - desc: "Browse the templates 'avatar looks create' accepts"
+    cmd: "heygen avatar look-templates list --limit 10"
+  - desc: "Find Look Packs curated for a female avatar"
+    cmd: "heygen avatar look-templates list --type look_pack --gender female"
