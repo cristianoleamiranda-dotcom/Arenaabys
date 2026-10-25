@@ -84,14 +84,20 @@ cp demo/reel.js /tmp/reel.mjs && node --check /tmp/reel.mjs
 # 2) render headless de todos los frames con un canvas simulado
 node scripts/smoke-reel.mjs
 
-# 3) levantar la demo
-python3 -m http.server 8080   # → /index.html y /demo/
+# 2b) visor de docs: renderizado, tablas, TOC y enlaces internos
+node scripts/check-docs.mjs
+
+# 3) levantar el preview (MIME correcto para .md/.mjs, sin caché)
+python3 scripts/serve.py 8080   # → /index.html, /demo/ y /viewer.html?doc=…
 
 # 4) audio: medir y normalizar (requiere ffmpeg)
 skills/audio-post-motion/scripts/loudness.sh medir pieza.wav
 ```
 
 Checklist de QC completo: `motion-graphics-es` §QC y `docs/02` §5.
+
+Con el servidor arriba, la revisión visual es: `/index.html` (hub + reel), `/demo/` (player),
+`/viewer.html?doc=docs/03-tutorial-practico.md` (documento con índice).
 
 ## 5 · Convenciones del repo
 

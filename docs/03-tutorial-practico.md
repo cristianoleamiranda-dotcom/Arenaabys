@@ -200,8 +200,10 @@ Usa el checklist de la sección 5 del documento 02. Añade además:
 
 ```bash
 # demo interactiva (canvas + WebAudio, sin dependencias)
-python3 -m http.server 8080 --directory demo
-# → http://localhost:8080
+python3 scripts/serve.py 8080
+# → http://localhost:8080            hub
+# → http://localhost:8080/demo/      reel
+# → http://localhost:8080/viewer.html  visor de estos documentos
 
 # skills disponibles para el agente
 ls .claude/skills

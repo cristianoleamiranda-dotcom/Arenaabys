@@ -12,4 +12,5 @@ Resumen ejecutivo para Claude Code / Codex / Cursor:
 4. **Verifica** con `scripts/smoke-reel.mjs` y el checklist de QC.
 5. **Registra** en `memory/memory.jsonl` cuando el usuario lo pida.
 
-Documentos de criterio en [`docs/`](./docs) · demo ejecutable en [`demo/`](./demo).
+Documentos de criterio en [`docs/`](./docs) · demo ejecutable en [`demo/`](./demo) ·
+servidor de desarrollo con MIME correcto en [`scripts/serve.py`](./scripts/serve.py).

@@ -16,20 +16,26 @@ Aquí no hay teoría suelta: hay **skills instaladas**, **documentos de oficio**
 | 🧠 | **39 skills activas** (37 de terceros + 2 propias) con activación automática | [`.claude/skills/`](.claude/skills) · [skills/](skills) |
 | 📚 | **4 documentos**: teoría, edición audiovisual, tutorial con ejercicios, catálogo de GitHub | [`docs/`](docs) |
 | 🎬 | **Reel interactivo** en canvas + WebAudio (sin dependencias, sin assets) | [`demo/`](demo) · [index.html](index.html) |
+| 📖 | **Visor de docs** (markdown → HTML, sin dependencias) con índice y buscador de secciones | [`viewer.html`](viewer.html) |
 | ◎ | **Memoria de largo plazo** en JSONL + protocolo de recuerdos | [`memory/`](memory) |
 | ⌘ | **Protocolo del agente**: cómo buscar, activar y recordar | [`AGENTS.md`](AGENTS.md) |
 
 ## Arranque rápido
 
 ```bash
-# demo interactiva (canvas + score sintetizado)
-python3 -m http.server 8080
-# → http://localhost:8080            hub con el reel embebido
-# → http://localhost:8080/demo/      reel a pantalla completa
+# servidor de desarrollo (sin dependencias, .md con su MIME correcto)
+python3 scripts/serve.py 8080
+# → http://localhost:8080             hub con el reel embebido
+# → http://localhost:8080/demo/       reel a pantalla completa
+# → http://localhost:8080/viewer.html lector de docs con índice
 
 # ver las skills instaladas
 npx skills list
 ls .claude/skills
+
+# verificar antes de commitear
+node scripts/smoke-reel.mjs    # 841 frames del reel sin errores
+node scripts/check-docs.mjs    # renderizado y enlaces de los 15 documentos
 
 # buscar en la memoria
 export MEMORY_FILE="$PWD/memory/memory.jsonl"

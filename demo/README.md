@@ -4,9 +4,13 @@ Una pieza de 28 s dibujada **frame a frame** en canvas 2D, con banda sonora sint
 WebAudio. Sin dependencias, sin fuentes externas, sin assets: se abre y funciona.
 
 ```bash
-python3 -m http.server 8080
+python3 scripts/serve.py 8080      # desde la raíz del repo
 # → http://localhost:8080/demo/
+# → http://localhost:8080/            hub con el reel embebido
 ```
+
+`scripts/serve.py` solo aporta tipos MIME correctos (`.md`, `.mjs`, `.jsonl`) y `no-store`;
+el reel funciona igual con cualquier servidor estático.
 
 | Tecla | Acción |
 |---|---|
